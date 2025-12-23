@@ -114,6 +114,38 @@ get_public_ip() {
 	echo "$ip"
 }
 
+# Check if port is available
+check_port_available() {
+	local port=$1
+	local protocol=${2:-tcp}
+	
+	# Check if port is in use
+	if command -v ss &> /dev/null; then
+		if ss -tuln 2>/dev/null | grep -q ":${port}"; then
+			# Port is in use, check what's using it
+			local process=$(ss -tulnp 2>/dev/null | grep ":${port}" | head -1)
+			if [[ -n "$process" ]]; then
+				log_warn "Port ${port} is already in use:"
+				log_warn "  $process"
+				return 1
+			fi
+			return 1
+		fi
+	elif command -v netstat &> /dev/null; then
+		if netstat -tuln 2>/dev/null | grep -q ":${port}"; then
+			local process=$(netstat -tulnp 2>/dev/null | grep ":${port}" | head -1)
+			if [[ -n "$process" ]]; then
+				log_warn "Port ${port} is already in use:"
+				log_warn "  $process"
+				return 1
+			fi
+			return 1
+		fi
+	fi
+	
+	return 0
+}
+
 # Auto-configure server with smart defaults
 configure_server() {
 	log_info "Configuring OpenVPN server with optimal settings..."
@@ -138,6 +170,82 @@ configure_server() {
 		FRAGMENT=1200
 		MSSFIX=1200
 		log_info "Using aggressive bypass mode (Port 443 TCP - optimized for Russia/China)"
+		
+		# Check if port 443 is available
+		if ! check_port_available 443 tcp; then
+			log_warn "⚠️  Port 443 is already in use!"
+			log_warn "This will prevent OpenVPN from starting and cause connection errors!"
+			log_warn ""
+			
+			# Try to identify what's using the port
+			local port_user=""
+			if command -v ss &> /dev/null; then
+				port_user=$(ss -tulnp 2>/dev/null | grep ":443" | head -1 || true)
+			elif command -v netstat &> /dev/null; then
+				port_user=$(netstat -tulnp 2>/dev/null | grep ":443" | head -1 || true)
+			fi
+			
+			if [[ -n "$port_user" ]]; then
+				log_warn "Port 443 is being used by:"
+				log_warn "  $port_user"
+				log_warn ""
+			fi
+			
+			log_warn "Options:"
+			log_warn "  1) Stop the conflicting service and use port 443 (recommended for bypassing blocks)"
+			log_warn "  2) Use alternative port 8443 (still looks like HTTPS, good for bypassing)"
+			log_warn "  3) Cancel installation"
+			log_warn ""
+			read -p "Select option [1-3]: " port_option
+			port_option=${port_option:-1}
+			
+			case $port_option in
+				1)
+					# Try to stop common services
+					if echo "$port_user" | grep -qi "sniproxy"; then
+						log_info "Attempting to stop sniproxy..."
+						systemctl stop sniproxy 2>/dev/null || service sniproxy stop 2>/dev/null || true
+						sleep 1
+						if check_port_available 443 tcp; then
+							log_success "Port 443 is now available"
+						else
+							log_warn "Could not free port 443. You may need to stop the service manually."
+						fi
+					elif echo "$port_user" | grep -qi "nginx"; then
+						log_info "Attempting to stop nginx..."
+						systemctl stop nginx 2>/dev/null || service nginx stop 2>/dev/null || true
+						sleep 1
+						if check_port_available 443 tcp; then
+							log_success "Port 443 is now available"
+						else
+							log_warn "Could not free port 443. You may need to stop the service manually."
+						fi
+					elif echo "$port_user" | grep -qi "apache"; then
+						log_info "Attempting to stop apache..."
+						systemctl stop apache2 2>/dev/null || systemctl stop httpd 2>/dev/null || true
+						sleep 1
+						if check_port_available 443 tcp; then
+							log_success "Port 443 is now available"
+						else
+							log_warn "Could not free port 443. You may need to stop the service manually."
+						fi
+					else
+						log_warn "Please stop the service using port 443 manually, then continue."
+						read -p "Press Enter after stopping the service..."
+					fi
+					;;
+				2)
+					PORT=8443
+					log_info "Using alternative port 8443 (still good for bypassing blocks)"
+					;;
+				3)
+					log_fatal "Installation cancelled."
+					;;
+				*)
+					log_warn "Invalid option, using port 443 anyway (may fail)"
+					;;
+			esac
+		fi
 	else
 		PROTOCOL=${PROTOCOL:-udp}
 		PORT=${PORT:-1194}
@@ -237,8 +345,16 @@ enable_ip_forwarding() {
 create_server_config() {
 	log_info "Creating OpenVPN server configuration..."
 	
+	# Determine correct config file location based on OS
 	local server_config="/etc/openvpn/server.conf"
 	local easyrsa_dir="/etc/openvpn/easy-rsa"
+	
+	# Some distributions use /etc/openvpn/server/server.conf
+	# But we'll use the standard location and create symlink if needed
+	local server_dir="/etc/openvpn/server"
+	if [[ ! -d "$server_dir" ]]; then
+		mkdir -p "$server_dir" 2>/dev/null || true
+	fi
 	
 	# Build configuration based on bypass mode
 	local obfuscation_settings=""
@@ -372,12 +488,55 @@ start_service() {
 	
 	if [[ "$service_started" == "true" ]]; then
 		log_success "OpenVPN service started"
+		
+		# Wait a bit and verify it's actually listening
+		sleep 3
+		local listening=false
+		local port_in_use_by=""
+		
+		if command -v ss &> /dev/null; then
+			port_in_use_by=$(ss -tulnp 2>/dev/null | grep ":${PORT}" | head -1 || true)
+			if echo "$port_in_use_by" | grep -qi openvpn; then
+				listening=true
+			elif [[ -n "$port_in_use_by" ]]; then
+				# Port is in use but not by OpenVPN
+				log_warn "Port ${PORT} is in use by another service:"
+				log_warn "  $port_in_use_by"
+			fi
+		elif command -v netstat &> /dev/null; then
+			port_in_use_by=$(netstat -tulnp 2>/dev/null | grep ":${PORT}" | head -1 || true)
+			if echo "$port_in_use_by" | grep -qi openvpn; then
+				listening=true
+			elif [[ -n "$port_in_use_by" ]]; then
+				log_warn "Port ${PORT} is in use by another service:"
+				log_warn "  $port_in_use_by"
+			fi
+		fi
+		
+		if [[ "$listening" == "true" ]]; then
+			log_success "✅ Server is listening on port ${PORT}/${PROTOCOL}"
+		else
+			log_error "❌ Service started but OpenVPN is NOT listening on port ${PORT}"
+			log_warn ""
+			log_warn "This will cause connection errors (error 15)!"
+			log_warn ""
+			log_warn "Troubleshooting:"
+			log_warn "  1. Check service status: systemctl status openvpn@server"
+			log_warn "  2. Check logs: journalctl -u openvpn@server -n 50"
+			if [[ "$PORT" == "443" ]]; then
+				log_warn "  3. Port 443 is often used by web servers (nginx/apache)"
+				log_warn "     Stop the web server or change OpenVPN port"
+			fi
+		fi
 	else
-		log_warn "OpenVPN service may not have started automatically."
-		log_warn "You may need to start it manually:"
-		log_warn "  systemctl start openvpn@server      # Debian/Ubuntu"
-		log_warn "  systemctl start openvpn-server@server  # CentOS/Fedora/Arch"
-		log_warn "Or check the service status and logs"
+		log_error "❌ OpenVPN service failed to start!"
+		log_warn ""
+		log_warn "Troubleshooting:"
+		log_warn "  1. Check service status: systemctl status openvpn@server"
+		log_warn "  2. Check logs: journalctl -u openvpn@server -n 50"
+		log_warn "  3. Try starting manually:"
+		log_warn "     systemctl start openvpn@server      # Debian/Ubuntu"
+		log_warn "     systemctl start openvpn-server@server  # CentOS/Fedora/Arch"
 	fi
 }
 
@@ -451,6 +610,11 @@ nobind
 persist-key
 persist-tun
 
+# Connection settings
+connect-retry 2
+connect-retry-max 3
+connect-timeout 30
+
 # Security
 remote-cert-tls server
 tls-client
@@ -461,8 +625,8 @@ tls-version-min 1.2
 # Compression
 ${COMPRESSION}
 
-# Performance
-verb 2
+# Performance  
+verb 3
 mute 20
 
 ${client_obfuscation}
@@ -706,174 +870,177 @@ uninstall_server() {
 	# Detect OS for package removal
 	detect_os
 	
-	# Remove packages
-	log_info "Removing OpenVPN packages..."
-	
-	local package_removed=false
+	# Remove packages - FORCE removal
+	log_info "Removing OpenVPN packages completely..."
 	
 	case $OS in
 		ubuntu|debian)
-			# Check if openvpn is installed
-			if dpkg -l | grep -q "^ii.*openvpn"; then
-				export DEBIAN_FRONTEND=noninteractive
-				if apt-get remove --purge -y openvpn 2>&1; then
-					package_removed=true
-				fi
-				apt-get autoremove -y >/dev/null 2>&1 || true
-			else
-				log_info "OpenVPN package not found in package manager"
-				package_removed=true  # Consider it removed if not installed via package manager
-			fi
+			export DEBIAN_FRONTEND=noninteractive
+			# Remove OpenVPN and all related packages
+			apt-get remove --purge -y openvpn openvpn-common 2>&1 || true
+			# Remove any OpenVPN-related packages
+			apt-get remove --purge -y $(dpkg -l | grep -i openvpn | awk '{print $2}') 2>&1 || true
+			# Clean up
+			apt-get autoremove -y 2>&1 || true
+			apt-get autoclean -y 2>&1 || true
+			log_success "OpenVPN packages removed"
 			;;
 		centos|rhel|rocky|almalinux|oracle)
 			if command -v dnf &> /dev/null; then
-				if dnf list installed openvpn &>/dev/null; then
-					if dnf remove -y openvpn 2>&1; then
-						package_removed=true
-					fi
-				else
-					log_info "OpenVPN package not found in package manager"
-					package_removed=true
-				fi
+				dnf remove -y openvpn 2>&1 || true
+				# Remove all OpenVPN-related packages
+				dnf remove -y $(rpm -qa | grep -i openvpn) 2>&1 || true
 			else
-				if yum list installed openvpn &>/dev/null; then
-					if yum remove -y openvpn 2>&1; then
-						package_removed=true
-					fi
-				else
-					log_info "OpenVPN package not found in package manager"
-					package_removed=true
-				fi
+				yum remove -y openvpn 2>&1 || true
+				# Remove all OpenVPN-related packages
+				yum remove -y $(rpm -qa | grep -i openvpn) 2>&1 || true
 			fi
+			log_success "OpenVPN packages removed"
 			;;
 		fedora)
-			if dnf list installed openvpn &>/dev/null; then
-				if dnf remove -y openvpn 2>&1; then
-					package_removed=true
-				fi
-			else
-				log_info "OpenVPN package not found in package manager"
-				package_removed=true
-			fi
+			dnf remove -y openvpn 2>&1 || true
+			# Remove all OpenVPN-related packages
+			dnf remove -y $(rpm -qa | grep -i openvpn) 2>&1 || true
+			log_success "OpenVPN packages removed"
 			;;
 		arch|manjaro)
-			if pacman -Q openvpn &>/dev/null; then
-				if pacman -R --noconfirm openvpn 2>&1; then
-					package_removed=true
-				fi
-			else
-				log_info "OpenVPN package not found in package manager"
-				package_removed=true
-			fi
+			pacman -R --noconfirm openvpn 2>&1 || true
+			# Remove all OpenVPN-related packages
+			pacman -R --noconfirm $(pacman -Q | grep -i openvpn | awk '{print $1}') 2>&1 || true
+			log_success "OpenVPN packages removed"
 			;;
 	esac
 	
-	if [[ "$package_removed" == "true" ]]; then
-		log_success "Packages removed"
-	else
-		log_warn "Package removal may have failed. OpenVPN might still be installed."
-		log_info "You may need to manually remove it with your package manager."
-	fi
+	# Remove ALL configuration files and data
+	log_info "Removing all configuration files and data..."
 	
-	# Remove configuration files
-	log_info "Removing configuration files..."
+	# Kill ALL OpenVPN processes first (more aggressive)
+	pkill -9 openvpn >/dev/null 2>&1 || true
+	pkill -9 -f openvpn >/dev/null 2>&1 || true
+	sleep 2
 	
-	# Remove main OpenVPN directory (includes server.conf, easy-rsa, etc.)
+	# Remove main OpenVPN directory (includes server.conf, easy-rsa, certificates, etc.)
 	rm -rf /etc/openvpn
 	
-	# Remove all .ovpn files from root
-	find /root -maxdepth 1 -name "*.ovpn" -type f -delete 2>/dev/null || true
+	# Remove all client directories and .ovpn files from /root
+	find /root -type d -name "*" -exec sh -c 'if [ -f "$1"/*.ovpn ] 2>/dev/null; then rm -rf "$1"; fi' _ {} \; 2>/dev/null || true
 	
-	# Remove client directories (directories containing .ovpn files)
-	for dir in /root/*/; do
-		if [[ -d "$dir" ]] && [[ -f "$dir"*.ovpn ]]; then
-			rm -rf "$dir" 2>/dev/null || true
-		fi
-	done
-	
-	# Remove any remaining OpenVPN-related files in /root
-	find /root -type f -name "*openvpn*" -delete 2>/dev/null || true
+	# Remove all .ovpn files anywhere in /root
 	find /root -type f -name "*.ovpn" -delete 2>/dev/null || true
 	
-	# Remove systemd service files if they exist
+	# Remove any OpenVPN-related files in /root
+	find /root -type f -name "*openvpn*" -delete 2>/dev/null || true
+	find /root -type d -name "*openvpn*" -exec rm -rf {} + 2>/dev/null || true
+	
+	# Remove systemd service files (all possible locations)
 	rm -f /etc/systemd/system/openvpn@*.service 2>/dev/null || true
 	rm -f /etc/systemd/system/openvpn-server@*.service 2>/dev/null || true
 	rm -f /usr/lib/systemd/system/openvpn@*.service 2>/dev/null || true
 	rm -f /usr/lib/systemd/system/openvpn-server@*.service 2>/dev/null || true
+	rm -f /lib/systemd/system/openvpn@*.service 2>/dev/null || true
+	rm -f /lib/systemd/system/openvpn-server@*.service 2>/dev/null || true
 	
-	# Reload systemd to remove stale service files
-	systemctl daemon-reload >/dev/null 2>&1 || true
+	# Remove any OpenVPN run files
+	rm -rf /var/run/openvpn* 2>/dev/null || true
+	rm -rf /run/openvpn* 2>/dev/null || true
 	
 	# Remove any OpenVPN log files
 	rm -f /var/log/openvpn*.log 2>/dev/null || true
+	rm -f /var/log/openvpn*.log.* 2>/dev/null || true
 	
-	# Remove any remaining OpenVPN processes (force kill if needed)
+	# Remove any OpenVPN lock files
+	rm -f /var/lock/openvpn* 2>/dev/null || true
+	rm -f /var/run/openvpn*.pid 2>/dev/null || true
+	
+	# Reload systemd to remove stale service files
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	systemctl reset-failed >/dev/null 2>&1 || true
+	
+	# Final kill of any remaining processes
+	pkill -9 openvpn >/dev/null 2>&1 || true
 	pkill -9 -f openvpn >/dev/null 2>&1 || true
 	sleep 1
 	
-	log_success "Configuration files removed"
+	log_success "All configuration files and data removed"
 	
-	# Verify uninstallation
-	log_info "Verifying uninstallation..."
+	# Final verification - check if anything OpenVPN-related remains
+	log_info "Verifying complete removal..."
 	
-	local still_installed=false
+	local remaining_items=0
 	
 	# Check if OpenVPN binary still exists
 	if command -v openvpn &>/dev/null; then
-		log_warn "OpenVPN binary still found in PATH"
-		still_installed=true
+		log_warn "⚠️  OpenVPN binary still found: $(command -v openvpn)"
+		((remaining_items++))
 	fi
 	
 	# Check if package is still installed
 	case $OS in
 		ubuntu|debian)
-			if dpkg -l | grep -q "^ii.*openvpn"; then
-				log_warn "OpenVPN package still installed"
-				still_installed=true
+			if dpkg -l 2>/dev/null | grep -q "^ii.*openvpn"; then
+				log_warn "⚠️  OpenVPN package(s) still installed:"
+				dpkg -l 2>/dev/null | grep openvpn | awk '{print "    " $2}' || true
+				((remaining_items++))
 			fi
 			;;
 		centos|rhel|rocky|almalinux|oracle|fedora)
 			if command -v dnf &> /dev/null; then
-				if dnf list installed openvpn &>/dev/null; then
-					log_warn "OpenVPN package still installed"
-					still_installed=true
+				if dnf list installed 2>/dev/null | grep -qi openvpn; then
+					log_warn "⚠️  OpenVPN package(s) still installed"
+					((remaining_items++))
 				fi
 			elif command -v yum &> /dev/null; then
-				if yum list installed openvpn &>/dev/null; then
-					log_warn "OpenVPN package still installed"
-					still_installed=true
+				if yum list installed 2>/dev/null | grep -qi openvpn; then
+					log_warn "⚠️  OpenVPN package(s) still installed"
+					((remaining_items++))
 				fi
 			fi
 			;;
 		arch|manjaro)
-			if pacman -Q openvpn &>/dev/null; then
-				log_warn "OpenVPN package still installed"
-				still_installed=true
+			if pacman -Q 2>/dev/null | grep -qi openvpn; then
+				log_warn "⚠️  OpenVPN package(s) still installed"
+				((remaining_items++))
 			fi
 			;;
 	esac
 	
 	# Check if config directory still exists
 	if [[ -d /etc/openvpn ]]; then
-		log_warn "Configuration directory /etc/openvpn still exists"
-		still_installed=true
+		log_warn "⚠️  Configuration directory /etc/openvpn still exists"
+		((remaining_items++))
+	fi
+	
+	# Check if any .ovpn files remain
+	if find /root -name "*.ovpn" -type f 2>/dev/null | grep -q .; then
+		log_warn "⚠️  Some .ovpn files still found in /root"
+		((remaining_items++))
+	fi
+	
+	# Check if any OpenVPN processes are running
+	if pgrep -f openvpn >/dev/null 2>&1; then
+		log_warn "⚠️  OpenVPN processes still running"
+		((remaining_items++))
 	fi
 	
 	echo ""
-	if [[ "$still_installed" == "true" ]]; then
-		log_warn "⚠️  Uninstallation may be incomplete!"
-		log_info "Some OpenVPN components may still be present."
+	if [[ $remaining_items -gt 0 ]]; then
+		log_warn "⚠️  Some OpenVPN components may still be present ($remaining_items items found)"
 		log_info "You may need to manually remove them."
 		echo ""
 	else
-		log_success "✅ OpenVPN server uninstallation completed!"
+		log_success "✅ Complete uninstallation successful!"
 		echo ""
-		log_info "Removed:"
-		log_info "  • OpenVPN packages"
-		log_info "  • Configuration files (/etc/openvpn)"
-		log_info "  • Client certificates and .ovpn files"
-		log_info "  • Systemd service files"
-		log_info "  • Firewall rules"
+		log_info "Everything removed:"
+		log_info "  ✅ OpenVPN packages"
+		log_info "  ✅ Configuration files (/etc/openvpn)"
+		log_info "  ✅ EasyRSA and certificates"
+		log_info "  ✅ Client .ovpn files"
+		log_info "  ✅ Systemd service files"
+		log_info "  ✅ Firewall rules"
+		log_info "  ✅ Log files"
+		log_info "  ✅ All OpenVPN processes"
+		echo ""
+		log_success "OpenVPN has been completely removed from the system!"
 		echo ""
 	fi
 	
@@ -1423,31 +1590,20 @@ show_interactive_menu() {
 	done
 }
 
-# Show usage/help (for command-line usage)
+# Show usage/help (minimal - interactive is default)
 show_usage() {
 	cat <<EOF
-OpenVPN Server Manager - Complete management tool
+OpenVPN Server Manager
 
-Interactive Mode (default):
-  $0                      Run interactive menu
+Just run the script - everything is interactive:
+  $0
 
-Command-Line Mode:
-  $0 install              Install OpenVPN server (automatic setup)
-  $0 add <username>        Add a new user/client
-  $0 remove <username>    Revoke and remove a user
-  $0 list                  List all users/clients
-  $0 status                Show server status
-  $0 info                  Show server configuration
-  $0 restart               Restart OpenVPN service
-  $0 logs                  View OpenVPN logs
-  $0 validate <file>       Validate a .ovpn configuration file
-  $0 uninstall             Uninstall OpenVPN server completely
-  $0 help                  Show this help message
-
-The installation uses aggressive bypass mode by default:
-  • Port 443 TCP (looks like HTTPS)
-  • Advanced obfuscation for bypassing DPI
-  • Optimized for countries with extensive blocking (Russia, China, etc.)
+No commands needed! The interactive menu will guide you through:
+  • Installing OpenVPN server
+  • Adding/removing users
+  • Managing the server
+  • Viewing status and logs
+  • Uninstalling
 
 EOF
 }
