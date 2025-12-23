@@ -423,21 +423,17 @@ create_client_config() {
 	fi
 	
 	# Build client obfuscation settings
+	# Note: Some options are removed for mobile compatibility
 	local client_obfuscation=""
 	if [[ "${BYPASS_MODE:-}" == "aggressive" ]]; then
 		client_obfuscation="# Advanced obfuscation settings for bypassing DPI
+# Mobile-compatible options only
 tun-mtu ${MTU}
-fragment ${FRAGMENT}
 mssfix ${MSSFIX}
-txqueuelen 1000
-sndbuf 393216
-rcvbuf 393216
-fast-io
-explicit-exit-notify 0"
+# Note: fragment, txqueuelen, fast-io, and explicit-exit-notify removed for mobile compatibility"
 	else
 		client_obfuscation="# Standard obfuscation
-sndbuf 0
-rcvbuf 0"
+# Mobile-compatible settings"
 	fi
 
 	# Create client configuration
@@ -459,7 +455,6 @@ persist-tun
 remote-cert-tls server
 tls-client
 cipher ${CIPHER}
-data-ciphers ${CIPHER}
 auth SHA256
 tls-version-min 1.2
 
