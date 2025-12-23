@@ -168,8 +168,19 @@ setup_easyrsa() {
 		rm -f "EasyRSA-${easyrsa_version}.tgz"
 	fi
 	
-	# Initialize PKI
-	./easyrsa init-pki
+	# Remove existing PKI if it exists (to avoid confirmation prompt)
+	if [[ -d pki ]]; then
+		log_info "Removing existing PKI directory..."
+		rm -rf pki
+	fi
+	
+	# Initialize PKI (non-interactive - automatically confirm)
+	# Use printf to send "yes" to the confirmation prompt
+	printf "yes\n" | ./easyrsa init-pki >/dev/null 2>&1 || {
+		# If that fails, try with explicit input
+		rm -rf pki 2>/dev/null || true
+		printf "yes\n" | ./easyrsa init-pki
+	}
 	
 	# Build CA
 	./easyrsa --batch build-ca nopass
@@ -523,8 +534,13 @@ EOF
 
 # Main installation function
 main_install() {
-	# Ensure INTERACTIVE_MODE is preserved if set (for error handling)
-	local was_interactive="${INTERACTIVE_MODE:-}"
+	# Ensure INTERACTIVE_MODE is set if we're in interactive mode
+	# This allows error handling to work correctly during installation
+	if [[ -z "${INTERACTIVE_MODE:-}" ]] && [[ -t 0 ]]; then
+		# If called from interactive menu, INTERACTIVE_MODE should already be set
+		# But if called directly and we have a TTY, assume interactive
+		export INTERACTIVE_MODE=true
+	fi
 	
 	echo ""
 	log_info "🚀 Starting OpenVPN server installation..."
@@ -539,11 +555,6 @@ main_install() {
 	configure_firewall
 	create_server_config
 	start_service
-	
-	# Restore INTERACTIVE_MODE if it was set (in case it was cleared)
-	if [[ -n "$was_interactive" ]]; then
-		export INTERACTIVE_MODE="$was_interactive"
-	fi
 	
 	echo ""
 	log_success "✅ OpenVPN server installation completed!"
@@ -703,27 +714,71 @@ uninstall_server() {
 	# Remove packages
 	log_info "Removing OpenVPN packages..."
 	
+	local package_removed=false
+	
 	case $OS in
 		ubuntu|debian)
-			apt-get remove --purge -y openvpn >/dev/null 2>&1 || true
-			apt-get autoremove -y >/dev/null 2>&1 || true
+			# Check if openvpn is installed
+			if dpkg -l | grep -q "^ii.*openvpn"; then
+				export DEBIAN_FRONTEND=noninteractive
+				if apt-get remove --purge -y openvpn 2>&1; then
+					package_removed=true
+				fi
+				apt-get autoremove -y >/dev/null 2>&1 || true
+			else
+				log_info "OpenVPN package not found in package manager"
+				package_removed=true  # Consider it removed if not installed via package manager
+			fi
 			;;
 		centos|rhel|rocky|almalinux|oracle)
 			if command -v dnf &> /dev/null; then
-				dnf remove -y openvpn >/dev/null 2>&1 || true
+				if dnf list installed openvpn &>/dev/null; then
+					if dnf remove -y openvpn 2>&1; then
+						package_removed=true
+					fi
+				else
+					log_info "OpenVPN package not found in package manager"
+					package_removed=true
+				fi
 			else
-				yum remove -y openvpn >/dev/null 2>&1 || true
+				if yum list installed openvpn &>/dev/null; then
+					if yum remove -y openvpn 2>&1; then
+						package_removed=true
+					fi
+				else
+					log_info "OpenVPN package not found in package manager"
+					package_removed=true
+				fi
 			fi
 			;;
 		fedora)
-			dnf remove -y openvpn >/dev/null 2>&1 || true
+			if dnf list installed openvpn &>/dev/null; then
+				if dnf remove -y openvpn 2>&1; then
+					package_removed=true
+				fi
+			else
+				log_info "OpenVPN package not found in package manager"
+				package_removed=true
+			fi
 			;;
 		arch|manjaro)
-			pacman -R --noconfirm openvpn >/dev/null 2>&1 || true
+			if pacman -Q openvpn &>/dev/null; then
+				if pacman -R --noconfirm openvpn 2>&1; then
+					package_removed=true
+				fi
+			else
+				log_info "OpenVPN package not found in package manager"
+				package_removed=true
+			fi
 			;;
 	esac
 	
-	log_success "Packages removed"
+	if [[ "$package_removed" == "true" ]]; then
+		log_success "Packages removed"
+	else
+		log_warn "Package removal may have failed. OpenVPN might still be installed."
+		log_info "You may need to manually remove it with your package manager."
+	fi
 	
 	# Remove configuration files
 	log_info "Removing configuration files..."
@@ -763,19 +818,70 @@ uninstall_server() {
 	
 	log_success "Configuration files removed"
 	
-	# Note: We don't revert IP forwarding as it might be used by other services
-	# Users can manually revert if needed: sysctl -w net.ipv4.ip_forward=0
+	# Verify uninstallation
+	log_info "Verifying uninstallation..."
+	
+	local still_installed=false
+	
+	# Check if OpenVPN binary still exists
+	if command -v openvpn &>/dev/null; then
+		log_warn "OpenVPN binary still found in PATH"
+		still_installed=true
+	fi
+	
+	# Check if package is still installed
+	case $OS in
+		ubuntu|debian)
+			if dpkg -l | grep -q "^ii.*openvpn"; then
+				log_warn "OpenVPN package still installed"
+				still_installed=true
+			fi
+			;;
+		centos|rhel|rocky|almalinux|oracle|fedora)
+			if command -v dnf &> /dev/null; then
+				if dnf list installed openvpn &>/dev/null; then
+					log_warn "OpenVPN package still installed"
+					still_installed=true
+				fi
+			elif command -v yum &> /dev/null; then
+				if yum list installed openvpn &>/dev/null; then
+					log_warn "OpenVPN package still installed"
+					still_installed=true
+				fi
+			fi
+			;;
+		arch|manjaro)
+			if pacman -Q openvpn &>/dev/null; then
+				log_warn "OpenVPN package still installed"
+				still_installed=true
+			fi
+			;;
+	esac
+	
+	# Check if config directory still exists
+	if [[ -d /etc/openvpn ]]; then
+		log_warn "Configuration directory /etc/openvpn still exists"
+		still_installed=true
+	fi
 	
 	echo ""
-	log_success "✅ OpenVPN server uninstallation completed!"
-	echo ""
-	log_info "Removed:"
-	log_info "  • OpenVPN packages"
-	log_info "  • Configuration files (/etc/openvpn)"
-	log_info "  • Client certificates and .ovpn files"
-	log_info "  • Systemd service files"
-	log_info "  • Firewall rules"
-	echo ""
+	if [[ "$still_installed" == "true" ]]; then
+		log_warn "⚠️  Uninstallation may be incomplete!"
+		log_info "Some OpenVPN components may still be present."
+		log_info "You may need to manually remove them."
+		echo ""
+	else
+		log_success "✅ OpenVPN server uninstallation completed!"
+		echo ""
+		log_info "Removed:"
+		log_info "  • OpenVPN packages"
+		log_info "  • Configuration files (/etc/openvpn)"
+		log_info "  • Client certificates and .ovpn files"
+		log_info "  • Systemd service files"
+		log_info "  • Firewall rules"
+		echo ""
+	fi
+	
 	log_info "Note: IP forwarding is still enabled. If not needed, you can disable it with:"
 	log_info "  sysctl -w net.ipv4.ip_forward=0"
 	echo ""
@@ -1196,15 +1302,11 @@ show_interactive_menu() {
 			
 			case $choice in
 				1)
-					if main_install; then
-						# Installation successful, menu will refresh and show new options
-						echo ""
-						read -p "Press Enter to continue..."
-					else
-						log_error "Installation failed. Please check the errors above."
-						echo ""
-						read -p "Press Enter to continue..."
-					fi
+					# INTERACTIVE_MODE is already exported, call main_install
+					# Errors will be handled gracefully and return to menu
+					main_install || log_error "Installation failed. Please check the errors above."
+					echo ""
+					read -p "Press Enter to continue..."
 					;;
 				2)
 					echo ""
