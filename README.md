@@ -2,7 +2,7 @@
 
 A one-time installation script for setting up an OpenVPN server on a VPS, optimized for bypassing network blocks and censorship.
 
-**Repository**: [https://github.com/skorches/openvpn-install](https://github.com/skorches/openvpn-install)
+**Repository**: [https://github.com/skorches/openvpn](https://github.com/skorches/openvpn)
 
 ## Features
 
@@ -22,58 +22,69 @@ A one-time installation script for setting up an OpenVPN server on a VPS, optimi
 
 1. Download the script to your VPS:
 ```bash
-wget https://raw.githubusercontent.com/skorches/openvpn-install/master/openvpn-install.sh
-# Or upload the script to your server
-```
-
-2. Make it executable:
-```bash
+wget https://raw.githubusercontent.com/skorches/openvpn/main/openvpn-install.sh
 chmod +x openvpn-install.sh
 ```
 
-3. Run the installation:
+2. Install OpenVPN server (one command, fully automatic):
 ```bash
 sudo ./openvpn-install.sh install
 ```
 
-Or run interactively:
+That's it! The script will automatically:
+- Detect your server IP
+- Use optimal settings (Port 443 TCP, aggressive bypass mode)
+- Configure everything automatically
+- Start the service
+
+### Adding Users
+
+Add a new user with a single command:
+
 ```bash
-sudo ./openvpn-install.sh
+sudo ./openvpn-install.sh add username
 ```
 
-### Adding Clients
-
-After installation, create client configurations:
-
+Example:
 ```bash
-sudo ./openvpn-install.sh add-client client1
+sudo ./openvpn-install.sh add john
+sudo ./openvpn-install.sh add alice
 ```
 
-This will create a `.ovpn` file in `/root/client1/client1.ovpn` that you can transfer to your client device.
+This creates a `.ovpn` file in `/root/username/username.ovpn` that you can transfer to your client device.
 
 ## Usage
 
-### Interactive Mode
-```bash
-sudo ./openvpn-install.sh
-```
+### Simple Commands
 
-This will show a menu with options to:
-1. Install OpenVPN server
-2. Add a new client
-3. Exit
-
-### Command Line Mode
-
-**Install server:**
+**Install server (automatic setup):**
 ```bash
 sudo ./openvpn-install.sh install
 ```
 
-**Add client:**
+**Add a user:**
 ```bash
-sudo ./openvpn-install.sh add-client <client-name>
+sudo ./openvpn-install.sh add <username>
 ```
+
+**Show help:**
+```bash
+sudo ./openvpn-install.sh help
+```
+
+### Examples
+
+```bash
+# Install OpenVPN server
+sudo ./openvpn-install.sh install
+
+# Add users
+sudo ./openvpn-install.sh add john
+sudo ./openvpn-install.sh add alice
+sudo ./openvpn-install.sh add bob
+```
+
+The installation is fully automatic with optimal defaults - no questions asked!
 
 ## Configuration Options
 

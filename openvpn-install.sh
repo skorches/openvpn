@@ -108,134 +108,42 @@ get_public_ip() {
 	echo "$ip"
 }
 
-# Interactive configuration
+# Auto-configure server with smart defaults
 configure_server() {
-	log_info "Configuring OpenVPN server..."
+	log_info "Configuring OpenVPN server with optimal settings..."
 	
 	# Get server IP
 	if [[ -z "${SERVER_IP:-}" ]]; then
 		SERVER_IP=$(get_public_ip)
+		log_info "Detected server IP: ${SERVER_IP}"
 	fi
 	
-	# Bypass mode selection (for countries with extensive blocking like Russia)
-	if [[ -z "${BYPASS_MODE:-}" ]]; then
-		echo ""
-		echo "Select bypass mode (for countries with extensive blocking):"
-		echo "1) Standard (default OpenVPN settings)"
-		echo "2) Aggressive (optimized for Russia/China - TCP 443, advanced obfuscation)"
-		read -p "Bypass mode [2]: " bypass_choice
-		bypass_choice=${bypass_choice:-2}
-		
-		case $bypass_choice in
-			1) BYPASS_MODE="standard" ;;
-			2) BYPASS_MODE="aggressive" ;;
-			*) BYPASS_MODE="aggressive" ;;
-		esac
-	fi
+	# Use aggressive mode by default (best for bypassing blocks)
+	BYPASS_MODE=${BYPASS_MODE:-aggressive}
 	
-	# Protocol selection
-	if [[ -z "${PROTOCOL:-}" ]]; then
-		if [[ "$BYPASS_MODE" == "aggressive" ]]; then
-			# For aggressive mode, default to TCP on port 443
-			PROTOCOL="tcp"
-			log_info "Aggressive mode: Using TCP protocol (better for bypassing DPI)"
-		else
-			echo ""
-			echo "Select protocol:"
-			echo "1) UDP (recommended, faster)"
-			echo "2) TCP (more reliable, can bypass some firewalls)"
-			read -p "Protocol [1]: " protocol_choice
-			protocol_choice=${protocol_choice:-1}
-			
-			case $protocol_choice in
-				1) PROTOCOL="udp" ;;
-				2) PROTOCOL="tcp" ;;
-				*) PROTOCOL="udp" ;;
-			esac
-		fi
-	fi
-	
-	# Port selection
-	if [[ -z "${PORT:-}" ]]; then
-		if [[ "$BYPASS_MODE" == "aggressive" ]]; then
-			# Port 443 looks like HTTPS traffic - hardest to block
-			PORT=443
-			log_info "Aggressive mode: Using port 443 (HTTPS port - best for bypassing blocks)"
-		else
-			read -p "Port [1194]: " port_input
-			PORT=${port_input:-1194}
-		fi
-	fi
-	
-	# DNS selection
-	if [[ -z "${DNS:-}" ]]; then
-		echo ""
-		echo "Select DNS provider:"
-		echo "1) Cloudflare (1.1.1.1)"
-		echo "2) Google (8.8.8.8)"
-		echo "3) Quad9 (9.9.9.9)"
-		echo "4) OpenDNS (208.67.222.222)"
-		echo "5) Custom"
-		read -p "DNS [1]: " dns_choice
-		dns_choice=${dns_choice:-1}
-		
-		case $dns_choice in
-			1) DNS="1.1.1.1" ;;
-			2) DNS="8.8.8.8" ;;
-			3) DNS="9.9.9.9" ;;
-			4) DNS="208.67.222.222" ;;
-			5)
-				read -p "Enter custom DNS: " DNS
-				;;
-			*) DNS="1.1.1.1" ;;
-		esac
-	fi
-	
-	# Cipher selection
-	if [[ -z "${CIPHER:-}" ]]; then
-		echo ""
-		echo "Select cipher (for bypassing blocks, AES-256-GCM is recommended):"
-		echo "1) AES-256-GCM (recommended, strong)"
-		echo "2) AES-128-GCM (faster)"
-		echo "3) CHACHA20-POLY1305 (modern, fast)"
-		read -p "Cipher [1]: " cipher_choice
-		cipher_choice=${cipher_choice:-1}
-		
-		case $cipher_choice in
-			1) CIPHER="AES-256-GCM" ;;
-			2) CIPHER="AES-128-GCM" ;;
-			3) CIPHER="CHACHA20-POLY1305" ;;
-			*) CIPHER="AES-256-GCM" ;;
-		esac
-	fi
-	
-	# Compression
-	if [[ -z "${COMPRESSION:-}" ]]; then
-		if [[ "$BYPASS_MODE" == "aggressive" ]]; then
-			# Disable compression in aggressive mode (can help with obfuscation)
-			COMPRESSION=""
-		else
-			echo ""
-			read -p "Enable compression? (y/n) [n]: " compression_choice
-			compression_choice=${compression_choice:-n}
-			if [[ "$compression_choice" =~ ^[Yy]$ ]]; then
-				COMPRESSION="compress lz4-v2"
-			else
-				COMPRESSION=""
-			fi
-		fi
-	fi
-	
-	# MTU settings for aggressive mode
+	# Set optimal defaults for aggressive mode
 	if [[ "$BYPASS_MODE" == "aggressive" ]]; then
+		PROTOCOL=${PROTOCOL:-tcp}
+		PORT=${PORT:-443}
+		CIPHER=${CIPHER:-AES-256-GCM}
+		DNS=${DNS:-1.1.1.1}
+		COMPRESSION=""
 		MTU=1200
 		FRAGMENT=1200
 		MSSFIX=1200
+		log_info "Using aggressive bypass mode (Port 443 TCP - optimized for Russia/China)"
 	else
+		PROTOCOL=${PROTOCOL:-udp}
+		PORT=${PORT:-1194}
+		CIPHER=${CIPHER:-AES-256-GCM}
+		DNS=${DNS:-1.1.1.1}
+		COMPRESSION=""
 		MTU=1500
 		FRAGMENT=""
 		MSSFIX=""
 	fi
+	
+	log_info "Configuration: ${PROTOCOL}://${SERVER_IP}:${PORT} | Cipher: ${CIPHER} | DNS: ${DNS}"
 }
 
 # Setup EasyRSA
@@ -471,11 +379,18 @@ create_client_config() {
 	local client_dir="/root/${client_name}"
 	mkdir -p "$client_dir"
 	
-	# Copy certificates
+	# Copy certificates (temporarily for embedding)
 	cp "${easyrsa_dir}/pki/ca.crt" "$client_dir/"
 	cp "${easyrsa_dir}/pki/issued/${client_name}.crt" "$client_dir/"
 	cp "${easyrsa_dir}/pki/private/${client_name}.key" "$client_dir/"
 	cp "${easyrsa_dir}/pki/tls-crypt.key" "$client_dir/"
+	
+	# Read and clean keys for mobile compatibility (remove trailing whitespace, normalize line endings)
+	local ca_cert cert key tls_crypt_key
+	ca_cert=$(cat "$client_dir/ca.crt" | sed 's/[[:space:]]*$//' | tr -d '\r')
+	cert=$(cat "$client_dir/${client_name}.crt" | sed 's/[[:space:]]*$//' | tr -d '\r')
+	key=$(cat "$client_dir/${client_name}.key" | sed 's/[[:space:]]*$//' | tr -d '\r')
+	tls_crypt_key=$(cat "$client_dir/tls-crypt.key" | sed 's/[[:space:]]*$//' | tr -d '\r')
 	
 	# Build client obfuscation settings
 	local client_obfuscation=""
@@ -517,7 +432,6 @@ cipher ${CIPHER}
 data-ciphers ${CIPHER}
 auth SHA256
 tls-version-min 1.2
-tls-crypt tls-crypt.key
 
 # Compression
 ${COMPRESSION}
@@ -528,33 +442,43 @@ mute 20
 
 ${client_obfuscation}
 
-# Certificates
+# Certificates (embedded for mobile compatibility)
 <ca>
-$(cat "$client_dir/ca.crt")
+${ca_cert}
 </ca>
 <cert>
-$(cat "$client_dir/${client_name}.crt")
+${cert}
 </cert>
 <key>
-$(cat "$client_dir/${client_name}.key")
+${key}
 </key>
 <tls-crypt>
-$(cat "$client_dir/tls-crypt.key")
+${tls_crypt_key}
 </tls-crypt>
 EOF
 
 	# Clean up separate certificate files
 	rm -f "$client_dir/ca.crt" "$client_dir/${client_name}.crt" "$client_dir/${client_name}.key" "$client_dir/tls-crypt.key"
 	
-	log_success "Client configuration created: $client_dir/${client_name}.ovpn"
 	echo ""
-	echo "Client configuration file: $client_dir/${client_name}.ovpn"
-	echo "Transfer this file to your client device and import it into your OpenVPN client."
+	log_success "Client configuration created!"
+	echo ""
+	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	echo "  File location: $client_dir/${client_name}.ovpn"
+	echo ""
+	echo "  To use this file:"
+	echo "  1. Transfer it to your device (scp, email, etc.)"
+	echo "  2. Import it into your OpenVPN client"
+	echo "  3. Connect!"
+	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	echo ""
 }
 
 # Main installation function
 main_install() {
-	log_info "Starting OpenVPN server installation..."
+	echo ""
+	log_info "🚀 Starting OpenVPN server installation..."
+	echo ""
 	
 	check_root
 	detect_os
@@ -567,58 +491,101 @@ main_install() {
 	start_service
 	
 	echo ""
-	log_success "OpenVPN server installation completed!"
+	log_success "✅ OpenVPN server installation completed!"
 	echo ""
-	echo "Server IP: ${SERVER_IP}"
-	echo "Port: ${PORT}"
-	echo "Protocol: ${PROTOCOL}"
-	echo "DNS: ${DNS}"
+	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	echo "  Server Configuration:"
+	echo "  • IP Address: ${SERVER_IP}"
+	echo "  • Port: ${PORT}"
+	echo "  • Protocol: ${PROTOCOL}"
+	echo "  • Cipher: ${CIPHER}"
+	echo "  • DNS: ${DNS}"
+	echo "  • Bypass Mode: ${BYPASS_MODE}"
+	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	echo ""
-	echo "To create a client configuration, run:"
-	echo "  $0 add-client <client-name>"
+	echo "To add a user, run:"
+	echo "  $0 add <username>"
 	echo ""
 }
 
-# Add client function
+# Add client function (simplified command)
 add_client() {
 	if [[ -z "${1:-}" ]]; then
-		log_fatal "Please provide a client name: $0 add-client <client-name>"
+		log_fatal "Please provide a username: $0 add <username>"
+	fi
+	
+	local client_name="$1"
+	
+	# Validate client name (alphanumeric and hyphens only)
+	if [[ ! "$client_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+		log_fatal "Invalid username. Use only letters, numbers, hyphens, and underscores."
 	fi
 	
 	check_root
-	create_client_config "$1"
+	
+	# Check if server is installed
+	if [[ ! -f /etc/openvpn/server.conf ]]; then
+		log_fatal "OpenVPN server is not installed. Run '$0 install' first."
+	fi
+	
+	# Load server configuration
+	if [[ -f /etc/openvpn/server.conf ]]; then
+		# Try to extract settings from existing config
+		PORT=${PORT:-$(grep "^port " /etc/openvpn/server.conf | awk '{print $2}' || echo "443")}
+		PROTOCOL=${PROTOCOL:-$(grep "^proto " /etc/openvpn/server.conf | awk '{print $2}' || echo "tcp")}
+		CIPHER=${CIPHER:-$(grep "^cipher " /etc/openvpn/server.conf | awk '{print $2}' || echo "AES-256-GCM")}
+		DNS=${DNS:-$(grep "dhcp-option DNS" /etc/openvpn/server.conf | awk '{print $3}' | head -1 || echo "1.1.1.1")}
+		SERVER_IP=${SERVER_IP:-$(get_public_ip)}
+		
+		# Detect bypass mode
+		if grep -q "tun-mtu 1200" /etc/openvpn/server.conf 2>/dev/null; then
+			BYPASS_MODE="aggressive"
+			MTU=1200
+			FRAGMENT=1200
+			MSSFIX=1200
+		else
+			BYPASS_MODE="standard"
+			MTU=1500
+			FRAGMENT=""
+			MSSFIX=""
+		fi
+		
+		if grep -q "compress" /etc/openvpn/server.conf 2>/dev/null; then
+			COMPRESSION="compress lz4-v2"
+		else
+			COMPRESSION=""
+		fi
+	fi
+	
+	log_info "Adding user: $client_name"
+	create_client_config "$client_name"
+	
+	echo ""
+	log_success "✅ User '$client_name' added successfully!"
+	echo ""
 }
 
-# Main menu
-show_menu() {
-	while true; do
-		echo ""
-		echo "OpenVPN Server Manager"
-		echo "======================"
-		echo "1) Install OpenVPN server"
-		echo "2) Add a new client"
-		echo "3) Exit"
-		echo ""
-		read -p "Select an option [1-3]: " choice
-		
-		case $choice in
-			1)
-				main_install
-				;;
-			2)
-				read -p "Enter client name: " client_name
-				if [[ -n "$client_name" ]]; then
-					add_client "$client_name"
-				fi
-				;;
-			3)
-				exit 0
-				;;
-			*)
-				log_error "Invalid option"
-				;;
-		esac
-	done
+# Show usage/help
+show_usage() {
+	cat <<EOF
+OpenVPN Server Installer - Simple one-command setup
+
+Usage:
+  $0 install              Install OpenVPN server (automatic setup)
+  $0 add <username>        Add a new user/client
+  $0 help                  Show this help message
+
+Examples:
+  $0 install               # Install server with optimal settings
+  $0 add john              # Add user 'john'
+  $0 add alice             # Add user 'alice'
+
+The installation uses aggressive bypass mode by default:
+  • Port 443 TCP (looks like HTTPS)
+  • Advanced obfuscation for bypassing DPI
+  • Optimized for countries with extensive blocking (Russia, China, etc.)
+
+EOF
 }
 
 # Main script logic
@@ -626,14 +593,19 @@ case "${1:-}" in
 	install)
 		main_install
 		;;
-	add-client)
+	add|user|client)
 		add_client "${2:-}"
 		;;
+	help|--help|-h)
+		show_usage
+		;;
 	"")
-		show_menu
+		show_usage
 		;;
 	*)
-		echo "Usage: $0 [install|add-client <name>]"
+		log_error "Unknown command: $1"
+		echo ""
+		show_usage
 		exit 1
 		;;
 esac
