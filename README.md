@@ -2,6 +2,8 @@
 
 A one-time installation script for setting up an OpenVPN server on a VPS, optimized for bypassing network blocks and censorship.
 
+**Repository**: [https://github.com/skorches/openvpn-install](https://github.com/skorches/openvpn-install)
+
 ## Features
 
 - **One-time installation**: Simple, automated setup process
@@ -20,7 +22,7 @@ A one-time installation script for setting up an OpenVPN server on a VPS, optimi
 
 1. Download the script to your VPS:
 ```bash
-wget https://raw.githubusercontent.com/yourusername/openvpn-install/master/openvpn-install.sh
+wget https://raw.githubusercontent.com/skorches/openvpn-install/master/openvpn-install.sh
 # Or upload the script to your server
 ```
 
