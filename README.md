@@ -26,121 +26,107 @@ wget https://raw.githubusercontent.com/skorches/openvpn/main/openvpn-install.sh
 chmod +x openvpn-install.sh
 ```
 
-2. Install OpenVPN server (one command, fully automatic):
+2. Run the script (interactive menu):
 ```bash
-sudo ./openvpn-install.sh install
+sudo ./openvpn-install.sh
 ```
 
-That's it! The script will automatically:
-- Detect your server IP
-- Use optimal settings (Port 443 TCP, aggressive bypass mode)
-- Configure everything automatically
-- Start the service
+The script will show an interactive menu where you can:
+- Install OpenVPN server (fully automatic)
+- Add users
+- List users
+- Remove users
+- View status and logs
+- And much more!
 
-### Adding Users
+**That's it!** Just run the script and follow the menu. Everything is automatic:
+- Detects your server IP
+- Uses optimal settings (Port 443 TCP, aggressive bypass mode)
+- Configures everything automatically
+- Starts the service
 
-Add a new user with a single command:
+### Quick Start
 
-```bash
-sudo ./openvpn-install.sh add username
-```
+1. **Install server**: Run the script and select option 1
+2. **Add users**: After installation, select option 1 from the menu
+3. **Manage**: Use the menu to list, remove, or manage users
 
-Example:
-```bash
-sudo ./openvpn-install.sh add john
-sudo ./openvpn-install.sh add alice
-```
-
-This creates a `.ovpn` file in `/root/username/username.ovpn` that you can transfer to your client device.
+The generated `.ovpn` files are in `/root/username/username.ovpn` - transfer them to your device and import into your OpenVPN client.
 
 ## Usage
 
-### Simple Commands
+### Interactive Mode (Recommended)
 
-**Install server (automatic setup):**
+Simply run the script without any arguments:
+
 ```bash
-sudo ./openvpn-install.sh install
+sudo ./openvpn-install.sh
 ```
 
-**Add a user:**
-```bash
-sudo ./openvpn-install.sh add <username>
-```
+This will show an interactive menu with all available options:
+- **Install OpenVPN Server** - One-click installation
+- **Add New User** - Create client configurations
+- **List All Users** - See all active clients
+- **Remove User** - Revoke and remove a user
+- **Show Server Status** - Check if server is running
+- **Show Server Info** - View configuration details
+- **Restart Service** - Restart OpenVPN
+- **View Logs** - Check server logs
+- **Validate Config** - Validate a .ovpn file
+- **Uninstall Server** - Remove everything
 
-**List all users:**
-```bash
-sudo ./openvpn-install.sh list
-```
+**No commands to remember - just run the script and use the menu!**
 
-**Remove a user:**
-```bash
-sudo ./openvpn-install.sh remove <username>
-```
+### Command-Line Mode (Optional)
 
-**Show server status:**
-```bash
-sudo ./openvpn-install.sh status
-```
-
-**Show server info:**
-```bash
-sudo ./openvpn-install.sh info
-```
-
-**Restart service:**
-```bash
-sudo ./openvpn-install.sh restart
-```
-
-**View logs:**
-```bash
-sudo ./openvpn-install.sh logs
-```
-
-**Uninstall server:**
-```bash
-sudo ./openvpn-install.sh uninstall
-```
-
-**Show help:**
-```bash
-sudo ./openvpn-install.sh help
-```
-
-### Examples
+For automation or scripts, you can still use command-line arguments:
 
 ```bash
-# Install OpenVPN server
+# Install server
 sudo ./openvpn-install.sh install
 
-# Add users
+# Add a user
 sudo ./openvpn-install.sh add john
-sudo ./openvpn-install.sh add alice
-sudo ./openvpn-install.sh add bob
 
-# List all users
+# List users
 sudo ./openvpn-install.sh list
 
-# Check server status
-sudo ./openvpn-install.sh status
-
-# View server configuration
-sudo ./openvpn-install.sh info
-
-# Remove a user (revokes certificate)
+# Remove user
 sudo ./openvpn-install.sh remove john
 
-# Restart service
-sudo ./openvpn-install.sh restart
+# Show status
+sudo ./openvpn-install.sh status
 
 # View logs
 sudo ./openvpn-install.sh logs
 
-# Uninstall OpenVPN (removes everything)
+# Uninstall
 sudo ./openvpn-install.sh uninstall
 ```
 
-The installation is fully automatic with optimal defaults - no questions asked!
+### Examples
+
+**Interactive mode:**
+```bash
+sudo ./openvpn-install.sh
+# Then select options from the menu
+```
+
+**Command-line mode:**
+```bash
+# Quick install
+sudo ./openvpn-install.sh install
+
+# Add multiple users quickly
+sudo ./openvpn-install.sh add john
+sudo ./openvpn-install.sh add alice
+sudo ./openvpn-install.sh add bob
+
+# Check status
+sudo ./openvpn-install.sh status
+```
+
+The installation is fully automatic with optimal defaults - just select from the menu!
 
 ## Configuration Options
 

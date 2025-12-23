@@ -386,12 +386,24 @@ create_client_config() {
 	cp "${easyrsa_dir}/pki/private/${client_name}.key" "$client_dir/"
 	cp "${easyrsa_dir}/pki/tls-crypt.key" "$client_dir/"
 	
-	# Read and clean keys for mobile compatibility (remove trailing whitespace, normalize line endings)
+	# Read and clean keys for mobile compatibility
+	# Properly format certificates and keys for embedding
 	local ca_cert cert key tls_crypt_key
+	
+	# Read certificates and keys, clean trailing whitespace and normalize line endings
+	# Preserve BEGIN/END markers and structure
 	ca_cert=$(cat "$client_dir/ca.crt" | sed 's/[[:space:]]*$//' | tr -d '\r')
 	cert=$(cat "$client_dir/${client_name}.crt" | sed 's/[[:space:]]*$//' | tr -d '\r')
 	key=$(cat "$client_dir/${client_name}.key" | sed 's/[[:space:]]*$//' | tr -d '\r')
-	tls_crypt_key=$(cat "$client_dir/tls-crypt.key" | sed 's/[[:space:]]*$//' | tr -d '\r')
+	
+	# Read tls-crypt key - it's a raw key without BEGIN/END markers
+	# Clean it but preserve line structure (usually 4 lines of base64)
+	tls_crypt_key=$(cat "$client_dir/tls-crypt.key" | sed 's/[[:space:]]*$//' | tr -d '\r' | sed '/^$/d')
+	
+	# Ensure key is not empty
+	if [[ -z "$tls_crypt_key" ]]; then
+		log_fatal "tls-crypt key is empty or could not be read"
+	fi
 	
 	# Build client obfuscation settings
 	local client_obfuscation=""
@@ -461,16 +473,44 @@ EOF
 	# Clean up separate certificate files
 	rm -f "$client_dir/ca.crt" "$client_dir/${client_name}.crt" "$client_dir/${client_name}.key" "$client_dir/tls-crypt.key"
 	
+	# Validate the generated file
+	local ovpn_file="$client_dir/${client_name}.ovpn"
+	if [[ ! -f "$ovpn_file" ]]; then
+		log_fatal "Failed to create client configuration file"
+	fi
+	
+	# Check that all required sections are present
+	if ! grep -q "^<ca>" "$ovpn_file" || ! grep -q "^</ca>" "$ovpn_file"; then
+		log_error "Warning: CA certificate section may be malformed"
+	fi
+	if ! grep -q "^<cert>" "$ovpn_file" || ! grep -q "^</cert>" "$ovpn_file"; then
+		log_error "Warning: Client certificate section may be malformed"
+	fi
+	if ! grep -q "^<key>" "$ovpn_file" || ! grep -q "^</key>" "$ovpn_file"; then
+		log_error "Warning: Client key section may be malformed"
+	fi
+	if ! grep -q "^<tls-crypt>" "$ovpn_file" || ! grep -q "^</tls-crypt>" "$ovpn_file"; then
+		log_error "Warning: tls-crypt key section may be malformed"
+	fi
+	
+	# Remove any trailing blank lines that might cause issues
+	sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$ovpn_file" 2>/dev/null || true
+	
 	echo ""
 	log_success "Client configuration created!"
 	echo ""
 	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	echo "  File location: $client_dir/${client_name}.ovpn"
+	echo "  File location: $ovpn_file"
 	echo ""
 	echo "  To use this file:"
 	echo "  1. Transfer it to your device (scp, email, etc.)"
 	echo "  2. Import it into your OpenVPN client"
 	echo "  3. Connect!"
+	echo ""
+	echo "  If you encounter import errors:"
+	echo "  • Ensure the file is complete (all certificates embedded)"
+	echo "  • Try transferring via different method (email, USB, etc.)"
+	echo "  • Check that your OpenVPN client supports tls-crypt"
 	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	echo ""
 }
@@ -941,6 +981,97 @@ restart_service() {
 	echo ""
 }
 
+# Validate/check a client config file
+validate_config() {
+	if [[ -z "${1:-}" ]]; then
+		log_fatal "Please provide a config file path: $0 validate <path-to-ovpn-file>"
+	fi
+	
+	local config_file="$1"
+	
+	if [[ ! -f "$config_file" ]]; then
+		log_fatal "Config file not found: $config_file"
+	fi
+	
+	echo ""
+	log_info "🔍 Validating OpenVPN configuration file: $config_file"
+	echo ""
+	
+	local errors=0
+	local warnings=0
+	
+	# Check for required sections
+	if ! grep -q "^<ca>" "$config_file"; then
+		log_error "❌ Missing <ca> section"
+		((errors++))
+	else
+		log_success "✅ CA certificate section found"
+	fi
+	
+	if ! grep -q "^<cert>" "$config_file"; then
+		log_error "❌ Missing <cert> section"
+		((errors++))
+	else
+		log_success "✅ Client certificate section found"
+	fi
+	
+	if ! grep -q "^<key>" "$config_file"; then
+		log_error "❌ Missing <key> section"
+		((errors++))
+	else
+		log_success "✅ Client key section found"
+	fi
+	
+	if ! grep -q "^<tls-crypt>" "$config_file"; then
+		log_warn "⚠️  Missing <tls-crypt> section (may not be required)"
+		((warnings++))
+	else
+		log_success "✅ tls-crypt key section found"
+	fi
+	
+	# Check for proper closing tags
+	if grep -q "^<ca>" "$config_file" && ! grep -q "^</ca>" "$config_file"; then
+		log_error "❌ <ca> section not properly closed"
+		((errors++))
+	fi
+	
+	if grep -q "^<cert>" "$config_file" && ! grep -q "^</cert>" "$config_file"; then
+		log_error "❌ <cert> section not properly closed"
+		((errors++))
+	fi
+	
+	if grep -q "^<key>" "$config_file" && ! grep -q "^</key>" "$config_file"; then
+		log_error "❌ <key> section not properly closed"
+		((errors++))
+	fi
+	
+	if grep -q "^<tls-crypt>" "$config_file" && ! grep -q "^</tls-crypt>" "$config_file"; then
+		log_error "❌ <tls-crypt> section not properly closed"
+		((errors++))
+	fi
+	
+	# Check file size (should be reasonable)
+	local file_size=$(stat -f%z "$config_file" 2>/dev/null || stat -c%s "$config_file" 2>/dev/null || echo "0")
+	if [[ $file_size -lt 1000 ]]; then
+		log_warn "⚠️  File seems too small ($file_size bytes) - may be incomplete"
+		((warnings++))
+	fi
+	
+	echo ""
+	if [[ $errors -eq 0 ]]; then
+		log_success "✅ Configuration file appears valid!"
+		if [[ $warnings -gt 0 ]]; then
+			log_info "⚠️  $warnings warning(s) found"
+		fi
+	else
+		log_error "❌ Found $errors error(s) in configuration file"
+		if [[ $warnings -gt 0 ]]; then
+			log_info "⚠️  $warnings warning(s) found"
+		fi
+	fi
+	echo ""
+}
+
 # View OpenVPN logs
 view_logs() {
 	check_root
@@ -971,34 +1102,170 @@ view_logs() {
 	echo ""
 }
 
-# Show usage/help
+# Interactive menu
+show_interactive_menu() {
+	# Check if we're in a terminal (for clear command)
+	local use_clear=false
+	if [[ -t 1 ]] && command -v clear &> /dev/null; then
+		use_clear=true
+	fi
+	
+	while true; do
+		if [[ "$use_clear" == "true" ]]; then
+			clear 2>/dev/null || true
+		fi
+		
+		echo ""
+		echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+		echo "  OpenVPN Server Manager"
+		echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+		echo ""
+		
+		# Check if server is installed
+		local server_installed=false
+		if [[ -f /etc/openvpn/server.conf ]]; then
+			server_installed=true
+			local service_status="❌ Stopped"
+			if systemctl is-active --quiet openvpn@server 2>/dev/null || \
+			   systemctl is-active --quiet openvpn-server@server 2>/dev/null; then
+				service_status="✅ Running"
+			fi
+			echo "  Server Status: $service_status"
+			echo ""
+		fi
+		
+		echo "  Main Menu:"
+		echo ""
+		
+		if [[ "$server_installed" == "false" ]]; then
+			echo "  1) Install OpenVPN Server"
+			echo "  2) Exit"
+			echo ""
+			read -p "  Select an option [1-2]: " choice
+			
+			case $choice in
+				1)
+					main_install
+					echo ""
+					read -p "Press Enter to continue..."
+					;;
+				2)
+					echo ""
+					log_info "Goodbye!"
+					exit 0
+					;;
+				*)
+					log_error "Invalid option. Please try again."
+					sleep 2
+					;;
+			esac
+		else
+			echo "  1) Add New User"
+			echo "  2) List All Users"
+			echo "  3) Remove User"
+			echo "  4) Show Server Status"
+			echo "  5) Show Server Info"
+			echo "  6) Restart Service"
+			echo "  7) View Logs"
+			echo "  8) Validate Config File"
+			echo "  9) Uninstall Server"
+			echo "  0) Exit"
+			echo ""
+			read -p "  Select an option [0-9]: " choice
+			
+			case $choice in
+				1)
+					echo ""
+					read -p "Enter username: " username
+					if [[ -n "$username" ]]; then
+						add_client "$username"
+					else
+						log_error "Username cannot be empty"
+					fi
+					echo ""
+					read -p "Press Enter to continue..."
+					;;
+				2)
+					list_users
+					read -p "Press Enter to continue..."
+					;;
+				3)
+					echo ""
+					read -p "Enter username to remove: " username
+					if [[ -n "$username" ]]; then
+						remove_user "$username"
+					else
+						log_error "Username cannot be empty"
+					fi
+					echo ""
+					read -p "Press Enter to continue..."
+					;;
+				4)
+					show_status
+					read -p "Press Enter to continue..."
+					;;
+				5)
+					show_info
+					read -p "Press Enter to continue..."
+					;;
+				6)
+					restart_service
+					read -p "Press Enter to continue..."
+					;;
+				7)
+					view_logs
+					read -p "Press Enter to continue..."
+					;;
+				8)
+					echo ""
+					read -p "Enter path to .ovpn file: " filepath
+					if [[ -n "$filepath" ]]; then
+						validate_config "$filepath"
+					else
+						log_error "File path cannot be empty"
+					fi
+					echo ""
+					read -p "Press Enter to continue..."
+					;;
+				9)
+					uninstall_server
+					echo ""
+					read -p "Press Enter to continue..."
+					;;
+				0)
+					echo ""
+					log_info "Goodbye!"
+					exit 0
+					;;
+				*)
+					log_error "Invalid option. Please try again."
+					sleep 2
+					;;
+			esac
+		fi
+	done
+}
+
+# Show usage/help (for command-line usage)
 show_usage() {
 	cat <<EOF
 OpenVPN Server Manager - Complete management tool
 
-Usage:
-  $0 install              Install OpenVPN server (automatic setup)
-  $0 add <username>       Add a new user/client
-  $0 remove <username>    Revoke and remove a user
-  $0 list                 List all users/clients
-  $0 status               Show server status
-  $0 info                 Show server configuration
-  $0 restart              Restart OpenVPN service
-  $0 logs                 View OpenVPN logs
-  $0 uninstall            Uninstall OpenVPN server completely
-  $0 help                 Show this help message
+Interactive Mode (default):
+  $0                      Run interactive menu
 
-Examples:
-  $0 install              # Install server with optimal settings
-  $0 add john              # Add user 'john'
-  $0 add alice             # Add user 'alice'
-  $0 list                  # List all users
-  $0 remove john           # Revoke and remove user 'john'
-  $0 status                # Check server status
-  $0 info                  # Show server configuration
-  $0 restart               # Restart the service
-  $0 logs                  # View recent logs
-  $0 uninstall             # Remove OpenVPN server completely
+Command-Line Mode:
+  $0 install              Install OpenVPN server (automatic setup)
+  $0 add <username>        Add a new user/client
+  $0 remove <username>    Revoke and remove a user
+  $0 list                  List all users/clients
+  $0 status                Show server status
+  $0 info                  Show server configuration
+  $0 restart               Restart OpenVPN service
+  $0 logs                  View OpenVPN logs
+  $0 validate <file>       Validate a .ovpn configuration file
+  $0 uninstall             Uninstall OpenVPN server completely
+  $0 help                  Show this help message
 
 The installation uses aggressive bypass mode by default:
   • Port 443 TCP (looks like HTTPS)
@@ -1034,6 +1301,9 @@ case "${1:-}" in
 	logs|log)
 		view_logs
 		;;
+	validate|check)
+		validate_config "${2:-}"
+		;;
 	uninstall)
 		uninstall_server
 		;;
@@ -1041,7 +1311,8 @@ case "${1:-}" in
 		show_usage
 		;;
 	"")
-		show_usage
+		# No arguments - show interactive menu
+		show_interactive_menu
 		;;
 	*)
 		log_error "Unknown command: $1"
