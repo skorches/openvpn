@@ -67,6 +67,41 @@ sudo ./openvpn-install.sh install
 sudo ./openvpn-install.sh add <username>
 ```
 
+**List all users:**
+```bash
+sudo ./openvpn-install.sh list
+```
+
+**Remove a user:**
+```bash
+sudo ./openvpn-install.sh remove <username>
+```
+
+**Show server status:**
+```bash
+sudo ./openvpn-install.sh status
+```
+
+**Show server info:**
+```bash
+sudo ./openvpn-install.sh info
+```
+
+**Restart service:**
+```bash
+sudo ./openvpn-install.sh restart
+```
+
+**View logs:**
+```bash
+sudo ./openvpn-install.sh logs
+```
+
+**Uninstall server:**
+```bash
+sudo ./openvpn-install.sh uninstall
+```
+
 **Show help:**
 ```bash
 sudo ./openvpn-install.sh help
@@ -82,6 +117,27 @@ sudo ./openvpn-install.sh install
 sudo ./openvpn-install.sh add john
 sudo ./openvpn-install.sh add alice
 sudo ./openvpn-install.sh add bob
+
+# List all users
+sudo ./openvpn-install.sh list
+
+# Check server status
+sudo ./openvpn-install.sh status
+
+# View server configuration
+sudo ./openvpn-install.sh info
+
+# Remove a user (revokes certificate)
+sudo ./openvpn-install.sh remove john
+
+# Restart service
+sudo ./openvpn-install.sh restart
+
+# View logs
+sudo ./openvpn-install.sh logs
+
+# Uninstall OpenVPN (removes everything)
+sudo ./openvpn-install.sh uninstall
 ```
 
 The installation is fully automatic with optimal defaults - no questions asked!
@@ -188,20 +244,23 @@ sudo iptables -I INPUT -p udp --dport 1194 -j ACCEPT
 
 ## Uninstallation
 
-To remove OpenVPN:
+To completely remove OpenVPN server and all configurations:
 
 ```bash
-# Stop and disable service
-sudo systemctl stop openvpn@server
-sudo systemctl disable openvpn@server
+sudo ./openvpn-install.sh uninstall
+```
 
-# Remove packages
-sudo apt-get remove --purge openvpn  # Debian/Ubuntu
-sudo yum remove openvpn              # CentOS/RHEL
+This will:
+- Stop and disable OpenVPN services
+- Remove OpenVPN packages
+- Remove all configuration files
+- Remove client certificates and .ovpn files
+- Clean up firewall rules
+- Ask for confirmation before proceeding
 
-# Remove configuration
-sudo rm -rf /etc/openvpn
-sudo rm -rf /root/*.ovpn
+**Note:** IP forwarding will remain enabled (in case other services need it). You can manually disable it with:
+```bash
+sysctl -w net.ipv4.ip_forward=0
 ```
 
 ## License

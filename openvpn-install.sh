@@ -298,9 +298,10 @@ persist-tun
 verb 2
 mute 20
 
-# Security enhancements
-remote-cert-tls client
-tls-server
+	# Security enhancements
+	remote-cert-tls client
+	tls-server
+	crl-verify /etc/openvpn/crl.pem
 
 ${obfuscation_settings}
 EOF
@@ -565,20 +566,439 @@ add_client() {
 	echo ""
 }
 
+# Uninstall OpenVPN server
+uninstall_server() {
+	check_root
+	
+	echo ""
+	log_warn "⚠️  This will completely remove OpenVPN server and all configurations!"
+	echo ""
+	
+	# Read port and protocol from config for firewall cleanup (if config exists)
+	local port protocol
+	if [[ -f /etc/openvpn/server.conf ]]; then
+		port=$(grep "^port " /etc/openvpn/server.conf 2>/dev/null | awk '{print $2}' || echo "443")
+		protocol=$(grep "^proto " /etc/openvpn/server.conf 2>/dev/null | awk '{print $2}' || echo "tcp")
+		log_info "Detected configuration: Port ${port}, Protocol ${protocol}"
+	else
+		port="443"
+		protocol="tcp"
+		log_warn "OpenVPN server does not appear to be installed."
+	fi
+	
+	echo ""
+	read -p "Are you sure you want to uninstall OpenVPN? (y/n) [n]: " confirm
+	if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+		log_info "Uninstallation cancelled."
+		exit 0
+	fi
+	
+	echo ""
+	log_info "🗑️  Starting OpenVPN uninstallation..."
+	
+	# Stop and disable services
+	log_info "Stopping OpenVPN services..."
+	
+	# Try different service names
+	if systemctl list-units --type=service 2>/dev/null | grep -q "openvpn@server"; then
+		systemctl stop openvpn@server >/dev/null 2>&1 || true
+		systemctl disable openvpn@server >/dev/null 2>&1 || true
+	fi
+	
+	if systemctl list-units --type=service 2>/dev/null | grep -q "openvpn-server@server"; then
+		systemctl stop openvpn-server@server >/dev/null 2>&1 || true
+		systemctl disable openvpn-server@server >/dev/null 2>&1 || true
+	fi
+	
+	if systemctl list-units --type=service 2>/dev/null | grep -q "^openvpn.service"; then
+		systemctl stop openvpn >/dev/null 2>&1 || true
+		systemctl disable openvpn >/dev/null 2>&1 || true
+	fi
+	
+	# Kill any remaining OpenVPN processes
+	pkill -f openvpn >/dev/null 2>&1 || true
+	sleep 1
+	
+	log_success "Services stopped"
+	
+	# Remove firewall rules
+	log_info "Removing firewall rules..."
+	
+	if command -v ufw &> /dev/null; then
+		ufw delete allow ${port}/${protocol} >/dev/null 2>&1 || true
+		log_success "UFW rules removed"
+	elif command -v firewall-cmd &> /dev/null; then
+		firewall-cmd --permanent --remove-port=${port}/${protocol} >/dev/null 2>&1 || true
+		firewall-cmd --reload >/dev/null 2>&1 || true
+		log_success "Firewalld rules removed"
+	elif command -v iptables &> /dev/null; then
+		iptables -D INPUT -p ${protocol} --dport ${port} -j ACCEPT >/dev/null 2>&1 || true
+		if command -v iptables-save &> /dev/null; then
+			iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+		fi
+		log_success "iptables rules removed"
+	fi
+	
+	# Detect OS for package removal
+	detect_os
+	
+	# Remove packages
+	log_info "Removing OpenVPN packages..."
+	
+	case $OS in
+		ubuntu|debian)
+			apt-get remove --purge -y openvpn >/dev/null 2>&1 || true
+			apt-get autoremove -y >/dev/null 2>&1 || true
+			;;
+		centos|rhel|rocky|almalinux|oracle)
+			if command -v dnf &> /dev/null; then
+				dnf remove -y openvpn >/dev/null 2>&1 || true
+			else
+				yum remove -y openvpn >/dev/null 2>&1 || true
+			fi
+			;;
+		fedora)
+			dnf remove -y openvpn >/dev/null 2>&1 || true
+			;;
+		arch|manjaro)
+			pacman -R --noconfirm openvpn >/dev/null 2>&1 || true
+			;;
+	esac
+	
+	log_success "Packages removed"
+	
+	# Remove configuration files
+	log_info "Removing configuration files..."
+	
+	rm -rf /etc/openvpn
+	rm -rf /root/*.ovpn 2>/dev/null || true
+	
+	# Remove client directories
+	for dir in /root/*/; do
+		if [[ -f "$dir"*.ovpn ]]; then
+			rm -rf "$dir"
+		fi
+	done 2>/dev/null || true
+	
+	log_success "Configuration files removed"
+	
+	# Note: We don't revert IP forwarding as it might be used by other services
+	# Users can manually revert if needed: sysctl -w net.ipv4.ip_forward=0
+	
+	echo ""
+	log_success "✅ OpenVPN server uninstallation completed!"
+	echo ""
+	log_info "Note: IP forwarding is still enabled. If not needed, you can disable it with:"
+	log_info "  sysctl -w net.ipv4.ip_forward=0"
+	echo ""
+}
+
+# List all users/clients
+list_users() {
+	check_root
+	
+	if [[ ! -f /etc/openvpn/server.conf ]]; then
+		log_fatal "OpenVPN server is not installed. Run '$0 install' first."
+	fi
+	
+	local easyrsa_dir="/etc/openvpn/easy-rsa"
+	
+	if [[ ! -d "$easyrsa_dir/pki/issued" ]]; then
+		log_warn "No clients found."
+		return
+	fi
+	
+	echo ""
+	log_info "📋 OpenVPN Users/Clients:"
+	echo ""
+	
+	local count=0
+	for cert in "$easyrsa_dir/pki/issued"/*.crt; do
+		[[ -f "$cert" ]] || continue
+		local name=$(basename "$cert" .crt)
+		
+		# Skip server certificate
+		[[ "$name" == "server" ]] && continue
+		
+		# Check if revoked
+		if [[ -f "$easyrsa_dir/pki/revoked/certs_by_serial.txt" ]] && \
+		   grep -q "$name" "$easyrsa_dir/pki/revoked/certs_by_serial.txt" 2>/dev/null; then
+			continue
+		fi
+		
+		# Check if .ovpn file exists
+		local ovpn_file="/root/${name}/${name}.ovpn"
+		if [[ -f "$ovpn_file" ]]; then
+			local file_size=$(du -h "$ovpn_file" | cut -f1)
+			echo "  ✅ $name (config: $ovpn_file, size: $file_size)"
+		else
+			echo "  ⚠️  $name (certificate exists but no .ovpn file)"
+		fi
+		((count++))
+	done
+	
+	if [[ $count -eq 0 ]]; then
+		log_warn "No active clients found."
+	else
+		echo ""
+		log_info "Total active clients: $count"
+	fi
+	echo ""
+}
+
+# Remove/revoke a user
+remove_user() {
+	if [[ -z "${1:-}" ]]; then
+		log_fatal "Please provide a username: $0 remove <username>"
+	fi
+	
+	local client_name="$1"
+	check_root
+	
+	if [[ ! -f /etc/openvpn/server.conf ]]; then
+		log_fatal "OpenVPN server is not installed."
+	fi
+	
+	local easyrsa_dir="/etc/openvpn/easy-rsa"
+	
+	# Check if client exists
+	if [[ ! -f "$easyrsa_dir/pki/issued/${client_name}.crt" ]]; then
+		log_fatal "User '$client_name' not found."
+	fi
+	
+	# Skip server certificate
+	if [[ "$client_name" == "server" ]]; then
+		log_fatal "Cannot remove server certificate."
+	fi
+	
+	echo ""
+	log_warn "⚠️  This will revoke user '$client_name' and remove their configuration."
+	read -p "Are you sure? (y/n) [n]: " confirm
+	if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+		log_info "Cancelled."
+		exit 0
+	fi
+	
+	echo ""
+	log_info "Revoking certificate for: $client_name"
+	
+	cd "$easyrsa_dir"
+	./easyrsa --batch revoke "$client_name" >/dev/null 2>&1 || true
+	./easyrsa --batch gen-crl >/dev/null 2>&1 || true
+	
+	# Copy CRL to OpenVPN directory
+	cp "$easyrsa_dir/pki/crl.pem" /etc/openvpn/crl.pem 2>/dev/null || true
+	
+	# Remove client directory and files
+	rm -rf "/root/${client_name}" 2>/dev/null || true
+	
+	# Update server config to use CRL if not already
+	if ! grep -q "^crl-verify" /etc/openvpn/server.conf 2>/dev/null; then
+		sed -i '/^# Security enhancements/a crl-verify /etc/openvpn/crl.pem' /etc/openvpn/server.conf 2>/dev/null || true
+		# Restart service to apply CRL
+		if systemctl is-active --quiet openvpn@server 2>/dev/null || \
+		   systemctl is-active --quiet openvpn-server@server 2>/dev/null; then
+			log_info "Restarting OpenVPN service to apply changes..."
+			systemctl restart openvpn@server 2>/dev/null || \
+			systemctl restart openvpn-server@server 2>/dev/null || true
+		fi
+	fi
+	
+	echo ""
+	log_success "✅ User '$client_name' has been revoked and removed!"
+	echo ""
+}
+
+# Show server status
+show_status() {
+	check_root
+	
+	echo ""
+	log_info "📊 OpenVPN Server Status:"
+	echo ""
+	
+	# Check if installed
+	if [[ ! -f /etc/openvpn/server.conf ]]; then
+		log_warn "OpenVPN server is not installed."
+		echo ""
+		return
+	fi
+	
+	# Service status
+	local service_status="❌ Stopped"
+	if systemctl is-active --quiet openvpn@server 2>/dev/null || \
+	   systemctl is-active --quiet openvpn-server@server 2>/dev/null; then
+		service_status="✅ Running"
+	fi
+	
+	echo "  Service Status: $service_status"
+	
+	# Read config
+	local port protocol server_ip
+	port=$(grep "^port " /etc/openvpn/server.conf 2>/dev/null | awk '{print $2}' || echo "N/A")
+	protocol=$(grep "^proto " /etc/openvpn/server.conf 2>/dev/null | awk '{print $2}' || echo "N/A")
+	server_ip=$(get_public_ip)
+	
+	echo "  Server IP: $server_ip"
+	echo "  Port: $port"
+	echo "  Protocol: $protocol"
+	
+	# Count clients
+	local easyrsa_dir="/etc/openvpn/easy-rsa"
+	local client_count=0
+	if [[ -d "$easyrsa_dir/pki/issued" ]]; then
+		for cert in "$easyrsa_dir/pki/issued"/*.crt; do
+			[[ -f "$cert" ]] || continue
+			local name=$(basename "$cert" .crt)
+			[[ "$name" == "server" ]] && continue
+			((client_count++))
+		done
+	fi
+	
+	echo "  Total Clients: $client_count"
+	
+	# Check if CRL is enabled
+	if grep -q "^crl-verify" /etc/openvpn/server.conf 2>/dev/null; then
+		echo "  Certificate Revocation: ✅ Enabled"
+	else
+		echo "  Certificate Revocation: ⚠️  Not enabled"
+	fi
+	
+	echo ""
+}
+
+# Show server information
+show_info() {
+	check_root
+	
+	if [[ ! -f /etc/openvpn/server.conf ]]; then
+		log_fatal "OpenVPN server is not installed. Run '$0 install' first."
+	fi
+	
+	echo ""
+	log_info "ℹ️  OpenVPN Server Information:"
+	echo ""
+	
+	# Read configuration
+	local port protocol cipher dns bypass_mode server_ip
+	port=$(grep "^port " /etc/openvpn/server.conf 2>/dev/null | awk '{print $2}' || echo "N/A")
+	protocol=$(grep "^proto " /etc/openvpn/server.conf 2>/dev/null | awk '{print $2}' || echo "N/A")
+	cipher=$(grep "^cipher " /etc/openvpn/server.conf 2>/dev/null | awk '{print $2}' || echo "N/A")
+	dns=$(grep "dhcp-option DNS" /etc/openvpn/server.conf 2>/dev/null | awk '{print $3}' | head -1 || echo "N/A")
+	server_ip=$(get_public_ip)
+	
+	if grep -q "tun-mtu 1200" /etc/openvpn/server.conf 2>/dev/null; then
+		bypass_mode="Aggressive (Port 443, optimized for bypassing blocks)"
+	else
+		bypass_mode="Standard"
+	fi
+	
+	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	echo "  Server Configuration:"
+	echo "  • IP Address: $server_ip"
+	echo "  • Port: $port"
+	echo "  • Protocol: $protocol"
+	echo "  • Cipher: $cipher"
+	echo "  • DNS: $dns"
+	echo "  • Bypass Mode: $bypass_mode"
+	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	echo ""
+	
+	# Show connection command
+	echo "  To connect, use the .ovpn file generated with:"
+	echo "    $0 add <username>"
+	echo ""
+}
+
+# Restart OpenVPN service
+restart_service() {
+	check_root
+	
+	if [[ ! -f /etc/openvpn/server.conf ]]; then
+		log_fatal "OpenVPN server is not installed. Run '$0 install' first."
+	fi
+	
+	log_info "Restarting OpenVPN service..."
+	
+	# Try different service names
+	local restarted=false
+	
+	if systemctl list-units --type=service 2>/dev/null | grep -q "openvpn@server"; then
+		systemctl restart openvpn@server >/dev/null 2>&1 && restarted=true
+	elif systemctl list-units --type=service 2>/dev/null | grep -q "openvpn-server@server"; then
+		systemctl restart openvpn-server@server >/dev/null 2>&1 && restarted=true
+	elif systemctl list-units --type=service 2>/dev/null | grep -q "^openvpn.service"; then
+		systemctl restart openvpn >/dev/null 2>&1 && restarted=true
+	fi
+	
+	sleep 1
+	
+	if [[ "$restarted" == "true" ]]; then
+		log_success "✅ OpenVPN service restarted"
+	else
+		log_error "Failed to restart service. Check status manually."
+	fi
+	echo ""
+}
+
+# View OpenVPN logs
+view_logs() {
+	check_root
+	
+	if [[ ! -f /etc/openvpn/server.conf ]]; then
+		log_fatal "OpenVPN server is not installed. Run '$0 install' first."
+	fi
+	
+	echo ""
+	log_info "📄 OpenVPN Logs (last 50 lines, press Ctrl+C to exit):"
+	echo ""
+	
+	# Try to get logs from journalctl
+	if systemctl list-units --type=service 2>/dev/null | grep -q "openvpn@server"; then
+		journalctl -u openvpn@server -n 50 --no-pager
+	elif systemctl list-units --type=service 2>/dev/null | grep -q "openvpn-server@server"; then
+		journalctl -u openvpn-server@server -n 50 --no-pager
+	elif systemctl list-units --type=service 2>/dev/null | grep -q "^openvpn.service"; then
+		journalctl -u openvpn -n 50 --no-pager
+	else
+		log_warn "Could not find OpenVPN service logs."
+		echo ""
+		log_info "You can also check:"
+		echo "  • /var/log/syslog (Debian/Ubuntu)"
+		echo "  • /var/log/messages (CentOS/RHEL)"
+		echo "  • journalctl -u openvpn@server -f (follow logs)"
+	fi
+	echo ""
+}
+
 # Show usage/help
 show_usage() {
 	cat <<EOF
-OpenVPN Server Installer - Simple one-command setup
+OpenVPN Server Manager - Complete management tool
 
 Usage:
   $0 install              Install OpenVPN server (automatic setup)
-  $0 add <username>        Add a new user/client
-  $0 help                  Show this help message
+  $0 add <username>       Add a new user/client
+  $0 remove <username>    Revoke and remove a user
+  $0 list                 List all users/clients
+  $0 status               Show server status
+  $0 info                 Show server configuration
+  $0 restart              Restart OpenVPN service
+  $0 logs                 View OpenVPN logs
+  $0 uninstall            Uninstall OpenVPN server completely
+  $0 help                 Show this help message
 
 Examples:
-  $0 install               # Install server with optimal settings
+  $0 install              # Install server with optimal settings
   $0 add john              # Add user 'john'
   $0 add alice             # Add user 'alice'
+  $0 list                  # List all users
+  $0 remove john           # Revoke and remove user 'john'
+  $0 status                # Check server status
+  $0 info                  # Show server configuration
+  $0 restart               # Restart the service
+  $0 logs                  # View recent logs
+  $0 uninstall             # Remove OpenVPN server completely
 
 The installation uses aggressive bypass mode by default:
   • Port 443 TCP (looks like HTTPS)
@@ -595,6 +1015,27 @@ case "${1:-}" in
 		;;
 	add|user|client)
 		add_client "${2:-}"
+		;;
+	remove|revoke|delete)
+		remove_user "${2:-}"
+		;;
+	list|users|clients)
+		list_users
+		;;
+	status)
+		show_status
+		;;
+	info|config)
+		show_info
+		;;
+	restart|reload)
+		restart_service
+		;;
+	logs|log)
+		view_logs
+		;;
+	uninstall)
+		uninstall_server
 		;;
 	help|--help|-h)
 		show_usage
