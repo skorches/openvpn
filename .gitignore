@@ -1,0 +1,9 @@
+*.log
+*.ovpn
+*.key
+*.crt
+*.pem
+easy-rsa/
+pki/
+openvpn-install.log
+
