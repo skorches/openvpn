@@ -43,7 +43,13 @@ log_error() {
 
 log_fatal() {
 	echo -e "${COLOR_RED}[FATAL]${COLOR_RESET} $*" >&2
-	exit 1
+	# In interactive mode, we want to return error instead of exiting
+	# Check if we're in interactive menu (set a flag)
+	if [[ "${INTERACTIVE_MODE:-}" == "true" ]]; then
+		return 1
+	else
+		exit 1
+	fi
 }
 
 # Check if running as root
@@ -816,7 +822,7 @@ remove_user() {
 	read -p "Are you sure? (y/n) [n]: " confirm
 	if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
 		log_info "Cancelled."
-		exit 0
+		return 0
 	fi
 	
 	echo ""
@@ -1104,6 +1110,9 @@ view_logs() {
 
 # Interactive menu
 show_interactive_menu() {
+	# Set flag for interactive mode (affects error handling)
+	export INTERACTIVE_MODE=true
+	
 	# Check if we're in a terminal (for clear command)
 	local use_clear=false
 	if [[ -t 1 ]] && command -v clear &> /dev/null; then
@@ -1145,9 +1154,15 @@ show_interactive_menu() {
 			
 			case $choice in
 				1)
-					main_install
-					echo ""
-					read -p "Press Enter to continue..."
+					if main_install; then
+						# Installation successful, menu will refresh and show new options
+						echo ""
+						read -p "Press Enter to continue..."
+					else
+						log_error "Installation failed. Please check the errors above."
+						echo ""
+						read -p "Press Enter to continue..."
+					fi
 					;;
 				2)
 					echo ""
@@ -1177,8 +1192,15 @@ show_interactive_menu() {
 				1)
 					echo ""
 					read -p "Enter username: " username
+					username=$(echo "$username" | tr -d '[:space:]')  # Trim whitespace
 					if [[ -n "$username" ]]; then
-						add_client "$username"
+						# Validate username format before calling
+						if [[ ! "$username" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+							log_error "Invalid username. Use only letters, numbers, hyphens, and underscores."
+						else
+							# Call function - log_fatal will return error in interactive mode instead of exiting
+							add_client "$username" || log_error "Failed to add user. Please check the errors above."
+						fi
 					else
 						log_error "Username cannot be empty"
 					fi
@@ -1192,8 +1214,18 @@ show_interactive_menu() {
 				3)
 					echo ""
 					read -p "Enter username to remove: " username
+					username=$(echo "$username" | tr -d '[:space:]')  # Trim whitespace
 					if [[ -n "$username" ]]; then
-						remove_user "$username"
+						# Check if user exists first
+						local easyrsa_dir="/etc/openvpn/easy-rsa"
+						if [[ ! -f "$easyrsa_dir/pki/issued/${username}.crt" ]]; then
+							log_error "User '$username' not found."
+						elif [[ "$username" == "server" ]]; then
+							log_error "Cannot remove server certificate."
+						else
+							# Call function - errors will be handled by log_fatal in interactive mode
+							remove_user "$username" || log_error "Failed to remove user. Please check the errors above."
+						fi
 					else
 						log_error "Username cannot be empty"
 					fi
@@ -1219,8 +1251,14 @@ show_interactive_menu() {
 				8)
 					echo ""
 					read -p "Enter path to .ovpn file: " filepath
+					filepath=$(echo "$filepath" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')  # Trim whitespace
 					if [[ -n "$filepath" ]]; then
-						validate_config "$filepath"
+						# Check if file exists first
+						if [[ ! -f "$filepath" ]]; then
+							log_error "Config file not found: $filepath"
+						else
+							validate_config "$filepath"
+						fi
 					else
 						log_error "File path cannot be empty"
 					fi
