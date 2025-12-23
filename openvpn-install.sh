@@ -523,6 +523,9 @@ EOF
 
 # Main installation function
 main_install() {
+	# Ensure INTERACTIVE_MODE is preserved if set (for error handling)
+	local was_interactive="${INTERACTIVE_MODE:-}"
+	
 	echo ""
 	log_info "🚀 Starting OpenVPN server installation..."
 	echo ""
@@ -536,6 +539,11 @@ main_install() {
 	configure_firewall
 	create_server_config
 	start_service
+	
+	# Restore INTERACTIVE_MODE if it was set (in case it was cleared)
+	if [[ -n "$was_interactive" ]]; then
+		export INTERACTIVE_MODE="$was_interactive"
+	fi
 	
 	echo ""
 	log_success "✅ OpenVPN server installation completed!"
@@ -636,7 +644,11 @@ uninstall_server() {
 	read -p "Are you sure you want to uninstall OpenVPN? (y/n) [n]: " confirm
 	if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
 		log_info "Uninstallation cancelled."
-		exit 0
+		if [[ "${INTERACTIVE_MODE:-}" == "true" ]]; then
+			return 0
+		else
+			exit 0
+		fi
 	fi
 	
 	echo ""
@@ -716,15 +728,38 @@ uninstall_server() {
 	# Remove configuration files
 	log_info "Removing configuration files..."
 	
+	# Remove main OpenVPN directory (includes server.conf, easy-rsa, etc.)
 	rm -rf /etc/openvpn
-	rm -rf /root/*.ovpn 2>/dev/null || true
 	
-	# Remove client directories
+	# Remove all .ovpn files from root
+	find /root -maxdepth 1 -name "*.ovpn" -type f -delete 2>/dev/null || true
+	
+	# Remove client directories (directories containing .ovpn files)
 	for dir in /root/*/; do
-		if [[ -f "$dir"*.ovpn ]]; then
-			rm -rf "$dir"
+		if [[ -d "$dir" ]] && [[ -f "$dir"*.ovpn ]]; then
+			rm -rf "$dir" 2>/dev/null || true
 		fi
-	done 2>/dev/null || true
+	done
+	
+	# Remove any remaining OpenVPN-related files in /root
+	find /root -type f -name "*openvpn*" -delete 2>/dev/null || true
+	find /root -type f -name "*.ovpn" -delete 2>/dev/null || true
+	
+	# Remove systemd service files if they exist
+	rm -f /etc/systemd/system/openvpn@*.service 2>/dev/null || true
+	rm -f /etc/systemd/system/openvpn-server@*.service 2>/dev/null || true
+	rm -f /usr/lib/systemd/system/openvpn@*.service 2>/dev/null || true
+	rm -f /usr/lib/systemd/system/openvpn-server@*.service 2>/dev/null || true
+	
+	# Reload systemd to remove stale service files
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	
+	# Remove any OpenVPN log files
+	rm -f /var/log/openvpn*.log 2>/dev/null || true
+	
+	# Remove any remaining OpenVPN processes (force kill if needed)
+	pkill -9 -f openvpn >/dev/null 2>&1 || true
+	sleep 1
 	
 	log_success "Configuration files removed"
 	
@@ -733,6 +768,13 @@ uninstall_server() {
 	
 	echo ""
 	log_success "✅ OpenVPN server uninstallation completed!"
+	echo ""
+	log_info "Removed:"
+	log_info "  • OpenVPN packages"
+	log_info "  • Configuration files (/etc/openvpn)"
+	log_info "  • Client certificates and .ovpn files"
+	log_info "  • Systemd service files"
+	log_info "  • Firewall rules"
 	echo ""
 	log_info "Note: IP forwarding is still enabled. If not needed, you can disable it with:"
 	log_info "  sysctl -w net.ipv4.ip_forward=0"
