@@ -359,10 +359,16 @@ create_server_config() {
 	# Build configuration based on bypass mode
 	local obfuscation_settings=""
 	if [[ "${BYPASS_MODE:-}" == "aggressive" ]]; then
+		# Fragment only works with UDP, not TCP
+		local fragment_line=""
+		if [[ "$PROTOCOL" == "udp" ]] && [[ -n "${FRAGMENT:-}" ]]; then
+			fragment_line="fragment ${FRAGMENT}"
+		fi
+		
 		obfuscation_settings="# Advanced obfuscation for bypassing extensive DPI (Russia/China)
 # Smaller MTU makes packets harder to analyze
 tun-mtu ${MTU}
-fragment ${FRAGMENT}
+${fragment_line}
 mssfix ${MSSFIX}
 
 # Packet size randomization (helps evade pattern detection)
@@ -375,8 +381,8 @@ rcvbuf 393216
 # Fast I/O for better performance with obfuscation
 fast-io
 
-# Reduce packet patterns
-explicit-exit-notify 0"
+# Reduce packet patterns (only for UDP)
+$(if [[ "$PROTOCOL" == "udp" ]]; then echo "explicit-exit-notify 0"; fi)"
 	else
 		obfuscation_settings="# Standard obfuscation settings
 sndbuf 0
