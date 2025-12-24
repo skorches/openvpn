@@ -309,19 +309,78 @@ setup_easyrsa() {
 configure_firewall() {
 	log_info "Configuring firewall..."
 	
+	# Get the default network interface (for NAT)
+	local default_interface=$(ip route | grep default | awk '{print $5}' | head -1)
+	if [[ -z "$default_interface" ]]; then
+		# Try alternative method
+		default_interface=$(route | grep default | awk '{print $8}' | head -1)
+	fi
+	
 	if command -v ufw &> /dev/null; then
+		# Allow OpenVPN port
 		ufw allow ${PORT}/${PROTOCOL} >/dev/null 2>&1 || true
-		log_success "UFW firewall configured"
-	elif command -v firewall-cmd &> /dev/null; then
-		firewall-cmd --permanent --add-port=${PORT}/${PROTOCOL} >/dev/null 2>&1 || true
-		firewall-cmd --reload >/dev/null 2>&1 || true
-		log_success "Firewalld configured"
-	elif command -v iptables &> /dev/null; then
-		iptables -I INPUT -p ${PROTOCOL} --dport ${PORT} -j ACCEPT >/dev/null 2>&1 || true
-		if command -v iptables-save &> /dev/null; then
-			iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+		
+		# Enable NAT for VPN traffic (UFW uses iptables under the hood)
+		# Add rule to /etc/ufw/before.rules if not present
+		if ! grep -q "OPENVPN_NAT_START" /etc/ufw/before.rules 2>/dev/null; then
+			# Find the line with "*filter" and add NAT rules before it
+			if [[ -f /etc/ufw/before.rules ]]; then
+				sed -i '/^*filter/i\
+# START OPENVPN NAT RULES\
+*nat\
+:POSTROUTING ACCEPT [0:0]\
+-A POSTROUTING -s 10.8.0.0/24 -o '"${default_interface:-eth0}"' -j MASQUERADE\
+COMMIT\
+# END OPENVPN NAT RULES\
+' /etc/ufw/before.rules 2>/dev/null || true
+			fi
 		fi
-		log_success "iptables configured"
+		
+		# Enable forwarding in UFW
+		if ! grep -q "net/ipv4/ip_forward" /etc/sysctl.conf 2>/dev/null; then
+			echo "net/ipv4/ip_forward=1" >> /etc/ufw/sysctl.conf 2>/dev/null || true
+		fi
+		
+		log_success "UFW firewall configured with NAT"
+	elif command -v firewall-cmd &> /dev/null; then
+		# Allow OpenVPN port
+		firewall-cmd --permanent --add-port=${PORT}/${PROTOCOL} >/dev/null 2>&1 || true
+		
+		# Enable masquerading (NAT) for the VPN subnet
+		firewall-cmd --permanent --add-masquerade >/dev/null 2>&1 || true
+		
+		# Allow forwarding from VPN to external
+		firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=10.8.0.0/24 masquerade" >/dev/null 2>&1 || true
+		
+		firewall-cmd --reload >/dev/null 2>&1 || true
+		log_success "Firewalld configured with NAT"
+	elif command -v iptables &> /dev/null; then
+		# Allow OpenVPN port
+		iptables -I INPUT -p ${PROTOCOL} --dport ${PORT} -j ACCEPT >/dev/null 2>&1 || true
+		
+		# Add NAT rule for VPN traffic (if not already present)
+		if ! iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -o ${default_interface:-eth0} -j MASQUERADE 2>/dev/null; then
+			iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o ${default_interface:-eth0} -j MASQUERADE >/dev/null 2>&1 || true
+		fi
+		
+		# Allow forwarding from VPN to external
+		iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT >/dev/null 2>&1 || true
+		iptables -I FORWARD -d 10.8.0.0/24 -j ACCEPT >/dev/null 2>&1 || true
+		
+		# Save iptables rules
+		if command -v iptables-save &> /dev/null; then
+			# Try to save to common locations
+			mkdir -p /etc/iptables 2>/dev/null || true
+			iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
+			iptables-save > /etc/iptables.rules 2>/dev/null || true
+			
+			# Also try netfilter-persistent if available
+			if command -v netfilter-persistent &> /dev/null; then
+				netfilter-persistent save >/dev/null 2>&1 || true
+			fi
+		fi
+		
+		log_success "iptables configured with NAT"
 	fi
 }
 
@@ -389,6 +448,24 @@ sndbuf 0
 rcvbuf 0"
 	fi
 
+	# Create CRL file if it doesn't exist (required for crl-verify)
+	local crl_file="/etc/openvpn/crl.pem"
+	if [[ ! -f "$crl_file" ]]; then
+		log_info "Creating Certificate Revocation List (CRL)..."
+		cd "$easyrsa_dir"
+		./easyrsa --batch gen-crl >/dev/null 2>&1 || true
+		if [[ -f "$easyrsa_dir/pki/crl.pem" ]]; then
+			cp "$easyrsa_dir/pki/crl.pem" "$crl_file"
+			chmod 644 "$crl_file"
+			log_success "CRL file created"
+		else
+			# Create empty CRL if generation fails
+			touch "$crl_file"
+			chmod 644 "$crl_file"
+			log_warn "Created empty CRL file (will be populated when certificates are revoked)"
+		fi
+	fi
+
 	cat > "$server_config" <<EOF
 # OpenVPN Server Configuration
 # Optimized for bypassing network blocks
@@ -437,10 +514,10 @@ persist-tun
 verb 2
 mute 20
 
-	# Security enhancements
-	remote-cert-tls client
-	tls-server
-	crl-verify /etc/openvpn/crl.pem
+# Security enhancements
+remote-cert-tls client
+tls-server
+crl-verify /etc/openvpn/crl.pem
 
 ${obfuscation_settings}
 EOF
@@ -917,46 +994,92 @@ uninstall_server() {
 			;;
 	esac
 	
-	# Remove ALL configuration files and data
-	log_info "Removing all configuration files and data..."
+	# Remove ALL configuration files and data - COMPREHENSIVE CLEANUP
+	log_info "Removing all configuration files and data (comprehensive cleanup)..."
 	
 	# Kill ALL OpenVPN processes first (more aggressive)
 	pkill -9 openvpn >/dev/null 2>&1 || true
 	pkill -9 -f openvpn >/dev/null 2>&1 || true
+	pkill -9 -f "openvpn@" >/dev/null 2>&1 || true
 	sleep 2
 	
 	# Remove main OpenVPN directory (includes server.conf, easy-rsa, certificates, etc.)
-	rm -rf /etc/openvpn
+	rm -rf /etc/openvpn 2>/dev/null || true
+	rm -rf /etc/openvpn-server 2>/dev/null || true
 	
-	# Remove all client directories and .ovpn files from /root
-	find /root -type d -name "*" -exec sh -c 'if [ -f "$1"/*.ovpn ] 2>/dev/null; then rm -rf "$1"; fi' _ {} \; 2>/dev/null || true
+	# Remove all client directories and .ovpn files from /root (more thorough)
+	# First, find and remove all directories that contain .ovpn files
+	find /root -type d 2>/dev/null | while read dir; do
+		if [[ -n "$dir" ]] && [[ -d "$dir" ]]; then
+			# Check if this directory contains .ovpn files
+			if find "$dir" -maxdepth 1 -name "*.ovpn" -type f 2>/dev/null | grep -q .; then
+				rm -rf "$dir" 2>/dev/null || true
+			fi
+		fi
+	done
 	
-	# Remove all .ovpn files anywhere in /root
+	# Remove all .ovpn files anywhere in /root (including subdirectories)
 	find /root -type f -name "*.ovpn" -delete 2>/dev/null || true
 	
-	# Remove any OpenVPN-related files in /root
-	find /root -type f -name "*openvpn*" -delete 2>/dev/null || true
+	# Remove any OpenVPN-related files in /root (all variations)
+	find /root -type f \( -name "*openvpn*" -o -name "*ovpn*" \) -delete 2>/dev/null || true
 	find /root -type d -name "*openvpn*" -exec rm -rf {} + 2>/dev/null || true
+	find /root -type d -name "*ovpn*" -exec rm -rf {} + 2>/dev/null || true
+	
+	# Remove from home directories (if script was run from different user)
+	find /home -type f -name "*.ovpn" -delete 2>/dev/null || true
+	find /home -type f -name "*openvpn*" -delete 2>/dev/null || true
+	find /home -type d -name "*openvpn*" -exec rm -rf {} + 2>/dev/null || true
 	
 	# Remove systemd service files (all possible locations)
 	rm -f /etc/systemd/system/openvpn@*.service 2>/dev/null || true
 	rm -f /etc/systemd/system/openvpn-server@*.service 2>/dev/null || true
+	rm -f /etc/systemd/system/multi-user.target.wants/openvpn@*.service 2>/dev/null || true
 	rm -f /usr/lib/systemd/system/openvpn@*.service 2>/dev/null || true
 	rm -f /usr/lib/systemd/system/openvpn-server@*.service 2>/dev/null || true
 	rm -f /lib/systemd/system/openvpn@*.service 2>/dev/null || true
 	rm -f /lib/systemd/system/openvpn-server@*.service 2>/dev/null || true
+	rm -f /run/systemd/generator/openvpn@*.service 2>/dev/null || true
 	
-	# Remove any OpenVPN run files
+	# Remove any OpenVPN run files and directories
 	rm -rf /var/run/openvpn* 2>/dev/null || true
 	rm -rf /run/openvpn* 2>/dev/null || true
+	rm -rf /var/lib/openvpn* 2>/dev/null || true
 	
-	# Remove any OpenVPN log files
+	# Remove any OpenVPN log files (all locations)
 	rm -f /var/log/openvpn*.log 2>/dev/null || true
 	rm -f /var/log/openvpn*.log.* 2>/dev/null || true
+	rm -f /var/log/openvpn*.log.*.gz 2>/dev/null || true
+	rm -rf /var/log/openvpn 2>/dev/null || true
 	
 	# Remove any OpenVPN lock files
 	rm -f /var/lock/openvpn* 2>/dev/null || true
 	rm -f /var/run/openvpn*.pid 2>/dev/null || true
+	rm -f /run/openvpn*.pid 2>/dev/null || true
+	
+	# Remove OpenVPN state files
+	rm -rf /var/lib/openvpn 2>/dev/null || true
+	rm -rf /var/cache/openvpn 2>/dev/null || true
+	
+	# Remove any OpenVPN config files in tmp
+	rm -f /tmp/*.ovpn 2>/dev/null || true
+	rm -f /tmp/*openvpn* 2>/dev/null || true
+	rm -rf /tmp/openvpn* 2>/dev/null || true
+	
+	# Remove any OpenVPN-related files from /usr/share, /usr/local, etc.
+	find /usr/share -type d -name "*openvpn*" -exec rm -rf {} + 2>/dev/null || true
+	find /usr/local -type d -name "*openvpn*" -exec rm -rf {} + 2>/dev/null || true
+	find /opt -type d -name "*openvpn*" -exec rm -rf {} + 2>/dev/null || true
+	
+	# Remove any remaining client certificate directories (by name pattern)
+	# This catches directories named after clients
+	if [[ -d /root ]]; then
+		for item in /root/*; do
+			if [[ -d "$item" ]] && [[ -f "$item"/*.ovpn ]] 2>/dev/null; then
+				rm -rf "$item" 2>/dev/null || true
+			fi
+		done
+	fi
 	
 	# Reload systemd to remove stale service files
 	systemctl daemon-reload >/dev/null 2>&1 || true
@@ -965,6 +1088,7 @@ uninstall_server() {
 	# Final kill of any remaining processes
 	pkill -9 openvpn >/dev/null 2>&1 || true
 	pkill -9 -f openvpn >/dev/null 2>&1 || true
+	pkill -9 -f "openvpn@" >/dev/null 2>&1 || true
 	sleep 1
 	
 	log_success "All configuration files and data removed"
@@ -1016,9 +1140,31 @@ uninstall_server() {
 		((remaining_items++))
 	fi
 	
-	# Check if any .ovpn files remain
+	# Check if any .ovpn files remain (check multiple locations)
 	if find /root -name "*.ovpn" -type f 2>/dev/null | grep -q .; then
 		log_warn "⚠️  Some .ovpn files still found in /root"
+		find /root -name "*.ovpn" -type f 2>/dev/null | head -5 | while read file; do
+			log_warn "    - $file"
+		done
+		((remaining_items++))
+	fi
+	
+	if find /home -name "*.ovpn" -type f 2>/dev/null | grep -q .; then
+		log_warn "⚠️  Some .ovpn files still found in /home"
+		((remaining_items++))
+	fi
+	
+	# Check if any OpenVPN directories remain
+	if find /root -type d -name "*openvpn*" 2>/dev/null | grep -q .; then
+		log_warn "⚠️  Some OpenVPN directories still found in /root"
+		((remaining_items++))
+	fi
+	
+	if [[ -d /etc/openvpn ]] || [[ -d /var/lib/openvpn ]] || [[ -d /var/log/openvpn ]]; then
+		log_warn "⚠️  Some OpenVPN directories still exist"
+		[[ -d /etc/openvpn ]] && log_warn "    - /etc/openvpn"
+		[[ -d /var/lib/openvpn ]] && log_warn "    - /var/lib/openvpn"
+		[[ -d /var/log/openvpn ]] && log_warn "    - /var/log/openvpn"
 		((remaining_items++))
 	fi
 	
@@ -1188,9 +1334,13 @@ show_status() {
 	
 	# Service status
 	local service_status="❌ Stopped"
-	if systemctl is-active --quiet openvpn@server 2>/dev/null || \
-	   systemctl is-active --quiet openvpn-server@server 2>/dev/null; then
+	local service_name=""
+	if systemctl is-active --quiet openvpn@server 2>/dev/null; then
 		service_status="✅ Running"
+		service_name="openvpn@server"
+	elif systemctl is-active --quiet openvpn-server@server 2>/dev/null; then
+		service_status="✅ Running"
+		service_name="openvpn-server@server"
 	fi
 	
 	echo "  Service Status: $service_status"
@@ -1205,6 +1355,93 @@ show_status() {
 	echo "  Port: $port"
 	echo "  Protocol: $protocol"
 	
+	# Check if server is actually listening on the port
+	echo ""
+	log_info "Connection Diagnostics:"
+	local listening=false
+	local port_in_use_by=""
+	
+	if [[ "$service_status" == "✅ Running" ]]; then
+		if command -v ss &> /dev/null; then
+			port_in_use_by=$(ss -tulnp 2>/dev/null | grep ":${port}" | head -1 || true)
+			if echo "$port_in_use_by" | grep -qi openvpn; then
+				listening=true
+				echo "  ✅ Server is listening on port ${port}/${protocol}"
+			elif [[ -n "$port_in_use_by" ]]; then
+				echo "  ❌ Port ${port} is in use by another service:"
+				echo "     $port_in_use_by"
+				echo "  ⚠️  This will cause connection errors!"
+			else
+				echo "  ❌ Server is NOT listening on port ${port}"
+				echo "  ⚠️  This will cause 'TCP connect error 23'!"
+			fi
+		elif command -v netstat &> /dev/null; then
+			port_in_use_by=$(netstat -tulnp 2>/dev/null | grep ":${port}" | head -1 || true)
+			if echo "$port_in_use_by" | grep -qi openvpn; then
+				listening=true
+				echo "  ✅ Server is listening on port ${port}/${protocol}"
+			elif [[ -n "$port_in_use_by" ]]; then
+				echo "  ❌ Port ${port} is in use by another service:"
+				echo "     $port_in_use_by"
+				echo "  ⚠️  This will cause connection errors!"
+			else
+				echo "  ❌ Server is NOT listening on port ${port}"
+				echo "  ⚠️  This will cause 'TCP connect error 23'!"
+			fi
+		fi
+		
+		# Check firewall
+		echo ""
+		log_info "Firewall Check:"
+		if command -v ufw &> /dev/null; then
+			if ufw status | grep -q "${port}/${protocol}"; then
+				echo "  ✅ UFW rule found for ${port}/${protocol}"
+			else
+				echo "  ⚠️  No UFW rule found for ${port}/${protocol}"
+				echo "     Run: ufw allow ${port}/${protocol}"
+			fi
+		elif command -v firewall-cmd &> /dev/null; then
+			if firewall-cmd --list-ports 2>/dev/null | grep -q "${port}/${protocol}"; then
+				echo "  ✅ Firewalld rule found for ${port}/${protocol}"
+			else
+				echo "  ⚠️  No Firewalld rule found for ${port}/${protocol}"
+				echo "     Run: firewall-cmd --permanent --add-port=${port}/${protocol} && firewall-cmd --reload"
+			fi
+		fi
+		
+		# Check service logs for errors
+		if [[ -n "$service_name" ]]; then
+			echo ""
+			log_info "Recent Service Logs:"
+			local recent_errors=$(journalctl -u "$service_name" -n 10 --no-pager 2>/dev/null | grep -i "error\|fail" | head -3 || true)
+			if [[ -n "$recent_errors" ]]; then
+				echo "  ⚠️  Recent errors found:"
+				echo "$recent_errors" | while read line; do
+					echo "     $line"
+				done
+			else
+				echo "  ✅ No recent errors in logs"
+			fi
+		fi
+		
+		if [[ "$listening" == "false" ]]; then
+			echo ""
+			log_warn "⚠️  TROUBLESHOOTING STEPS:"
+			echo "  1. Check service logs: journalctl -u $service_name -n 50"
+			echo "  2. Verify config file: cat /etc/openvpn/server.conf"
+			echo "  3. Check if port is available: ss -tulnp | grep :${port}"
+			if [[ "$port" == "443" ]]; then
+				echo "  4. Port 443 conflict? Stop web server: systemctl stop nginx (or apache2)"
+			fi
+			echo "  5. Restart service: systemctl restart $service_name"
+		fi
+	else
+		echo ""
+		log_warn "⚠️  Service is not running!"
+		echo "  Start it with: systemctl start openvpn@server"
+		echo "  Or check why it failed: journalctl -u openvpn@server -n 50"
+	fi
+	
 	# Count clients
 	local easyrsa_dir="/etc/openvpn/easy-rsa"
 	local client_count=0
@@ -1217,6 +1454,7 @@ show_status() {
 		done
 	fi
 	
+	echo ""
 	echo "  Total Clients: $client_count"
 	
 	# Check if CRL is enabled
@@ -1284,21 +1522,81 @@ restart_service() {
 	
 	# Try different service names
 	local restarted=false
+	local service_name=""
 	
-	if systemctl list-units --type=service 2>/dev/null | grep -q "openvpn@server"; then
-		systemctl restart openvpn@server >/dev/null 2>&1 && restarted=true
-	elif systemctl list-units --type=service 2>/dev/null | grep -q "openvpn-server@server"; then
-		systemctl restart openvpn-server@server >/dev/null 2>&1 && restarted=true
-	elif systemctl list-units --type=service 2>/dev/null | grep -q "^openvpn.service"; then
-		systemctl restart openvpn >/dev/null 2>&1 && restarted=true
+	# First, try to find which service name exists
+	if systemctl list-unit-files 2>/dev/null | grep -q "openvpn@server"; then
+		service_name="openvpn@server"
+		systemctl restart "$service_name" 2>&1
+		sleep 2
+		if systemctl is-active --quiet "$service_name" 2>/dev/null; then
+			restarted=true
+		fi
+	elif systemctl list-unit-files 2>/dev/null | grep -q "openvpn-server@server"; then
+		service_name="openvpn-server@server"
+		systemctl restart "$service_name" 2>&1
+		sleep 2
+		if systemctl is-active --quiet "$service_name" 2>/dev/null; then
+			restarted=true
+		fi
+	elif systemctl list-unit-files 2>/dev/null | grep -q "^openvpn.service"; then
+		service_name="openvpn"
+		systemctl restart "$service_name" 2>&1
+		sleep 2
+		if systemctl is-active --quiet "$service_name" 2>/dev/null; then
+			restarted=true
+		fi
 	fi
-	
-	sleep 1
 	
 	if [[ "$restarted" == "true" ]]; then
 		log_success "✅ OpenVPN service restarted"
+		
+		# Verify it's listening
+		sleep 2
+		local port=$(grep "^port " /etc/openvpn/server.conf 2>/dev/null | awk '{print $2}' || echo "443")
+		if command -v ss &> /dev/null; then
+			if ss -tulnp 2>/dev/null | grep ":${port}" | grep -qi openvpn; then
+				log_success "✅ Server is listening on port ${port}"
+			else
+				log_warn "⚠️  Service started but may not be listening on port ${port}"
+				log_warn "Check logs: journalctl -u ${service_name} -n 50"
+			fi
+		fi
 	else
-		log_error "Failed to restart service. Check status manually."
+		log_error "❌ Failed to restart service!"
+		echo ""
+		
+		# Show the actual error from logs
+		if [[ -n "$service_name" ]]; then
+			log_warn "Recent error logs:"
+			local error_log=$(journalctl -u "$service_name" -n 10 --no-pager 2>/dev/null | tail -5 || true)
+			if [[ -n "$error_log" ]]; then
+				echo "$error_log" | while read line; do
+					echo "  $line"
+				done
+			fi
+			echo ""
+		fi
+		
+		log_warn "Troubleshooting steps:"
+		if [[ -n "$service_name" ]]; then
+			log_warn "  1. Check detailed logs: journalctl -u $service_name -n 50"
+			log_warn "  2. Check config file: cat /etc/openvpn/server.conf"
+			log_warn "  3. Test config manually: openvpn --config /etc/openvpn/server.conf --verb 4"
+		else
+			log_warn "  1. Try: systemctl start openvpn@server"
+			log_warn "  2. Or: systemctl start openvpn-server@server"
+			log_warn "  3. Check logs: journalctl -u openvpn@server -n 50"
+		fi
+		echo ""
+		log_warn "Common issues:"
+		log_warn "  • Port conflict (check: ss -tulnp | grep :443)"
+		log_warn "  • Config file error - fragment/explicit-exit-notify with TCP (check logs)"
+		log_warn "  • Missing certificates (check: ls -la /etc/openvpn/easy-rsa/pki/)"
+		log_warn "  • Wrong file paths in config"
+		echo ""
+		log_info "Run this to see the exact error:"
+		log_info "  journalctl -u $service_name -n 50 --no-pager"
 	fi
 	echo ""
 }
@@ -1424,6 +1722,168 @@ view_logs() {
 	echo ""
 }
 
+# Fix networking (NAT and forwarding) for internet access
+fix_networking() {
+	check_root
+	
+	if [[ ! -f /etc/openvpn/server.conf ]]; then
+		log_fatal "OpenVPN server is not installed. Run '$0 install' first."
+	fi
+	
+	echo ""
+	log_info "🔧 Fixing networking for internet access..."
+	echo ""
+	
+	# Get default network interface
+	local default_interface=$(ip route | grep default | awk '{print $5}' | head -1)
+	if [[ -z "$default_interface" ]]; then
+		default_interface=$(route -n | grep '^0.0.0.0' | awk '{print $8}' | head -1)
+	fi
+	if [[ -z "$default_interface" ]]; then
+		# Try to find any non-loopback interface
+		default_interface=$(ip -4 addr show | grep -v "lo:" | grep -oP '(?<=^\d+: )\w+' | head -1)
+	fi
+	
+	if [[ -z "$default_interface" ]]; then
+		log_error "Could not detect network interface. Please specify manually."
+		read -p "Enter network interface name (e.g., eth0, ens3): " default_interface
+	fi
+	
+	log_info "Using network interface: $default_interface"
+	
+	# Enable IP forwarding
+	log_info "Enabling IP forwarding..."
+	sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+	if [[ -f /etc/sysctl.conf ]]; then
+		if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf; then
+			echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+		fi
+	fi
+	
+	# Configure based on firewall type
+	if command -v ufw &> /dev/null; then
+		log_info "Configuring UFW with NAT..."
+		
+		# Check if NAT rules already exist
+		if ! grep -q "OPENVPN_NAT_START" /etc/ufw/before.rules 2>/dev/null; then
+			# Backup original file
+			cp /etc/ufw/before.rules /etc/ufw/before.rules.bak 2>/dev/null || true
+			
+			# Find the line with "*filter" and add NAT rules before it
+			# Use a more reliable method
+			if [[ -f /etc/ufw/before.rules ]]; then
+				# Create temp file with NAT rules
+				local temp_file=$(mktemp)
+				cat > "$temp_file" <<EOF
+# START OPENVPN NAT RULES
+*nat
+:POSTROUTING ACCEPT [0:0]
+-A POSTROUTING -s 10.8.0.0/24 -o $default_interface -j MASQUERADE
+COMMIT
+# END OPENVPN NAT RULES
+
+EOF
+				# Insert before *filter line
+				if grep -q "^*filter" /etc/ufw/before.rules; then
+					sed -i '/^*filter/r '"$temp_file" /etc/ufw/before.rules
+				else
+					# If no *filter found, append at beginning
+					cat "$temp_file" /etc/ufw/before.rules > /etc/ufw/before.rules.new
+					mv /etc/ufw/before.rules.new /etc/ufw/before.rules
+				fi
+				rm -f "$temp_file"
+			fi
+		fi
+		
+		# Enable forwarding in UFW sysctl
+		if [[ -f /etc/ufw/sysctl.conf ]]; then
+			if ! grep -q "^net/ipv4/ip_forward" /etc/ufw/sysctl.conf; then
+				echo "net/ipv4/ip_forward=1" >> /etc/ufw/sysctl.conf
+			fi
+		fi
+		
+		# Also add to main sysctl.conf
+		if [[ -f /etc/sysctl.conf ]]; then
+			if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf; then
+				echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+			fi
+		fi
+		
+		# Reload UFW to apply changes
+		ufw reload >/dev/null 2>&1 || true
+		log_success "UFW configured with NAT"
+		
+	elif command -v firewall-cmd &> /dev/null; then
+		log_info "Configuring Firewalld with NAT..."
+		
+		firewall-cmd --permanent --add-masquerade >/dev/null 2>&1 || true
+		firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=10.8.0.0/24 masquerade" >/dev/null 2>&1 || true
+		firewall-cmd --reload >/dev/null 2>&1 || true
+		log_success "Firewalld configured with NAT"
+		
+	else
+		# Use iptables directly
+		log_info "Configuring iptables with NAT..."
+		
+		# Remove old rules if they exist
+		iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o "$default_interface" -j MASQUERADE 2>/dev/null || true
+		
+		# Add NAT rule
+		iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o "$default_interface" -j MASQUERADE
+		
+		# Add forwarding rules
+		iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT 2>/dev/null || true
+		iptables -I FORWARD -d 10.8.0.0/24 -j ACCEPT 2>/dev/null || true
+		
+		# Save rules
+		if command -v iptables-save &> /dev/null; then
+			mkdir -p /etc/iptables 2>/dev/null || true
+			iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
+			iptables-save > /etc/iptables.rules 2>/dev/null || true
+			
+			if command -v netfilter-persistent &> /dev/null; then
+				netfilter-persistent save >/dev/null 2>&1 || true
+			fi
+		fi
+		
+		log_success "iptables configured with NAT"
+	fi
+	
+	# Verify
+	echo ""
+	log_info "Verifying configuration..."
+	
+	# Check IP forwarding
+	if [[ $(sysctl -n net.ipv4.ip_forward) == "1" ]]; then
+		log_success "✅ IP forwarding is enabled"
+	else
+		log_error "❌ IP forwarding is NOT enabled"
+	fi
+	
+	# Check NAT rule
+	if iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -q "10.8.0.0/24.*MASQUERADE"; then
+		log_success "✅ NAT rule is configured"
+	else
+		log_warn "⚠️  NAT rule may not be configured correctly"
+	fi
+	
+	# Check forwarding rules
+	if iptables -L FORWARD -n 2>/dev/null | grep -q "10.8.0.0/24"; then
+		log_success "✅ Forwarding rules are configured"
+	else
+		log_warn "⚠️  Forwarding rules may not be configured"
+	fi
+	
+	echo ""
+	log_success "✅ Networking fix complete!"
+	echo ""
+	log_info "If clients still can't access internet:"
+	log_info "  1. Disconnect and reconnect the VPN client"
+	log_info "  2. Check client can ping VPN server: ping 10.8.0.1"
+	log_info "  3. Check DNS: nslookup google.com"
+	echo ""
+}
+
 # Interactive menu
 show_interactive_menu() {
 	# Set flag for interactive mode (affects error handling)
@@ -1498,7 +1958,7 @@ show_interactive_menu() {
 			echo "  9) Uninstall Server"
 			echo "  0) Exit"
 			echo ""
-			read -p "  Select an option [0-9]: " choice
+			read -p "  Select an option [0-10]: " choice
 			
 			case $choice in
 				1)
@@ -1578,6 +2038,10 @@ show_interactive_menu() {
 					read -p "Press Enter to continue..."
 					;;
 				9)
+					fix_networking
+					read -p "Press Enter to continue..."
+					;;
+				10)
 					uninstall_server
 					echo ""
 					read -p "Press Enter to continue..."
@@ -1642,6 +2106,9 @@ case "${1:-}" in
 		;;
 	validate|check)
 		validate_config "${2:-}"
+		;;
+	fix|fix-networking|networking)
+		fix_networking
 		;;
 	uninstall)
 		uninstall_server
